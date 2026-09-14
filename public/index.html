@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>[DAN] RECALL DASHBOARD</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/icons.js"></script>
+</head>
+<body>
+  <header>
+    <a class="dan-logo" href="/"><span class="dan-br">[</span>DAN<span class="dan-br">]</span> RECALL DASHBOARD</a>
+    <span class="tagline">Remember. Recall. Forget.</span>
+  </header>
+
+  <aside class="intro-box">
+    <p class="intro-heading dan-dot">Sovereign <span class="dan-br">[</span>AI<span class="dan-br">]</span> system of <span class="dan-br">[</span>Systems<span class="dan-br">]</span></p>
+    <p><span class="dan-br">[</span>DAN<span class="dan-br">]</span> is a sovereign AI system of
+      systems — the Digital Architecture Network. Built edge-first, on-device, in the UAE.</p>
+    <p class="intro-strong">Privacy is the architecture, not the afterthought.</p>
+    <p class="intro-mono dan-dot">
+      <span class="dan-br">[</span>DAN<span class="dan-br">]</span> — DIGITAL ARCHITECTURE NETWORK, LET'S GO <span class="dan-br">[</span>BEYOND<span class="dan-br">]</span>
+    </p>
+    <p class="intro-mono">
+      STRATO MESH NETWORK<br>
+      <span class="site-text">www.thedubai.ai</span>
+    </p>
+  </aside>
+
+  <div class="layout">
+  <main>
+    <div class="dan-card">
+      <h2><span id="icon-mode"></span>Mode</h2>
+      <div id="status">Reading real state…</div>
+    </div>
+
+    <div class="dan-card">
+      <h2><span id="icon-remember"></span>Remember</h2>
+      <textarea id="rememberText" placeholder="A real thing to remember…"></textarea>
+      <div class="char-count" id="rememberCount">0 characters</div>
+      <button class="dan-btn" id="rememberBtn">Remember</button>
+      <span class="hint" id="rememberStatus"></span>
+    </div>
+
+    <div class="dan-card">
+      <h2><span id="icon-recall"></span>Recall</h2>
+      <div class="recall-row">
+        <input type="text" id="recallQuery" placeholder="What are you trying to recall?">
+        <button class="dan-btn" id="recallBtn">Recall</button>
+      </div>
+      <ul class="memory-list" id="recallResults"></ul>
+    </div>
+
+    <div class="dan-card">
+      <h2><span id="icon-list"></span>All real memories</h2>
+      <ul class="memory-list" id="memoryList"></ul>
+    </div>
+  </main>
+  </div>
+
+  <footer>
+    <strong><span class="dan-br">[</span>DAN<span class="dan-br">]</span> MEMORY SMASH</strong> —
+    the full codebase-memory engine this tool's recall capability also lives inside —
+    is coming soon.
+  </footer>
+
+  <script>
+    // px=3 — a small inline glyph beside an h2 label, matching the fix already applied to
+    // DAN-OSS-COMMIT's own icons (the library's 12px default rendered far too large here).
+    document.getElementById("icon-mode").innerHTML = DANIcons.dot("pulse", 3);
+    document.getElementById("icon-remember").innerHTML = DANIcons.dot("pin", 3);
+    document.getElementById("icon-recall").innerHTML = DANIcons.dot("search", 3);
+    document.getElementById("icon-list").innerHTML = DANIcons.dot("folder", 3);
+  </script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

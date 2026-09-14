@@ -1,0 +1,6 @@
+.env*
+node_modules/
+.dan-oss-recall-dashboard/
+examples/example-data/
+*.log
+.DS_Store
