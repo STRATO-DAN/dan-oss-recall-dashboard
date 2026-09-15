@@ -7,14 +7,14 @@
 **A real memory server with a real ranking engine — recall scored by relevance, not a raw dump.**
 
 [![CI](https://github.com/STRATO-DAN/dan-oss-recall-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/STRATO-DAN/dan-oss-recall-dashboard/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/dan-oss-recall-dashboard.svg)](https://www.npmjs.com/package/dan-oss-recall-dashboard)
+[![npm version](https://img.shields.io/npm/v/@strato-dan/recall-dashboard.svg)](https://www.npmjs.com/package/@strato-dan/recall-dashboard)
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-0-2e9e56.svg)](#dependencies)
 [![docs](https://img.shields.io/badge/docs-README-blue.svg)](#use)
 [![license](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
 
 </div>
 
-> **⚡ One install, then direct use — on any platform.** `npx dan-oss-recall-dashboard` runs the
+> **⚡ One install, then direct use — on any platform.** `npx @strato-dan/recall-dashboard` runs the
 > full app; keyword (BM25) recall is pure Node standard library. Semantic **hybrid** mode needs no
 > second step: LanceDB auto-installs when your platform supports it, and an exact pure-JS vector
 > engine takes over automatically if it can't — so hybrid works out of the box either way (it just
@@ -36,7 +36,7 @@ engine.
 ## Use
 
 ```bash
-npx dan-oss-recall-dashboard
+npx @strato-dan/recall-dashboard
 ```
 
 Opens at `http://127.0.0.1:4872` (loopback only). Type something into **Remember**, then search
@@ -199,7 +199,7 @@ covering the cosine fallback) — all with no key, no network, and no LanceDB in
 |---|---|
 | **Required runtime dependencies** | **0** — keyword (BM25) recall and the whole UI are pure Node standard library |
 | **Optional (auto, hybrid mode)** | `@lancedb/lancedb@0.30.0` — auto-installed for your platform in the same `npx` / `npm install`. If it can't build on your platform the install still succeeds and an exact pure-JS cosine engine takes over automatically. Pinned deliberately (see [Two vector engines](#two-vector-engines-one-install-no-choice-to-make)). |
-| **Install to run** | none beyond the single `npx dan-oss-recall-dashboard` |
+| **Install to run** | none beyond the single `npx @strato-dan/recall-dashboard` |
 | **Install to test** | none — `npm test` uses Node's built-in test runner |
 | **Hybrid mode needs** | your own `OPENAI_API_KEY` (configuration, not a package) |
 | **Node** | ≥ 18 |
