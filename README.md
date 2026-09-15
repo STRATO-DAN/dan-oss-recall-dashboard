@@ -255,14 +255,14 @@ both and always available.
 
 ## Contributing
 
-See the org-level [CONTRIBUTING.md](https://github.com/STRATO-DAN/.github/blob/main/CONTRIBUTING.md)
+See [CONTRIBUTING.md](CONTRIBUTING.md)
 for how to file an issue or submit a PR. Maintainers may use AI tools to help review
 contributions — please don't include personal information in an issue, PR, or commit beyond
 what's needed to describe the change.
 
 ## Releasing
 
-See the org-level [RELEASING.md](https://github.com/STRATO-DAN/.github/blob/main/RELEASING.md) —
+See [RELEASING.md](RELEASING.md) —
 the same version-bump/tag/publish process applies to every DAN-OSS tool, this one included.
 
 ## License
