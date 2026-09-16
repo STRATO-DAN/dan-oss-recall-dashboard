@@ -1,6 +1,35 @@
 // [DAN] RECALL DASHBOARD — real client logic, plain fetch + DOM.
 const $ = (id) => document.getElementById(id);
 
+// [DAN] RECALL DASHBOARD (v0.2) — the API now requires the instance bearer token. It arrives in the
+// launch URL (?token=…); capture it once, strip it from the visible URL, and attach it to every API
+// call. Reopen via the URL the CLI printed if it's missing.
+const RECALL_TOKEN = (() => {
+  try {
+    const u = new URL(location.href);
+    const fromUrl = u.searchParams.get("token");
+    if (fromUrl) {
+      try { sessionStorage.setItem("recallToken", fromUrl); } catch {}
+      u.searchParams.delete("token");
+      history.replaceState(null, "", u.pathname + u.search + u.hash);
+      return fromUrl;
+    }
+    return sessionStorage.getItem("recallToken") || "";
+  } catch {
+    return "";
+  }
+})();
+
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), authorization: `Bearer ${RECALL_TOKEN}` };
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401 && $("status")) {
+    $("status").innerHTML =
+      `<span class="mode-badge">Access token missing or invalid — reopen the dashboard using the URL the CLI printed.</span>`;
+  }
+  return res;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -49,7 +78,7 @@ function memoryRow(m, opts = {}) {
 }
 
 async function loadStatus() {
-  const res = await fetch("/api/status");
+  const res = await api("/api/status");
   const data = await res.json();
   const badge = data.mode === "hybrid"
     ? `<span class="mode-badge vector" title="mode: hybrid">Keyword + Meaning — real hybrid search (BM25 + semantic)</span>`
@@ -58,7 +87,7 @@ async function loadStatus() {
 }
 
 async function loadMemories() {
-  const res = await fetch("/api/memories");
+  const res = await api("/api/memories");
   const data = await res.json();
   const list = $("memoryList");
   if (!data.ok || data.memories.length === 0) {
@@ -72,7 +101,7 @@ async function remember() {
   const text = $("rememberText").value;
   const status = $("rememberStatus");
   status.textContent = "Remembering…";
-  const res = await fetch("/api/remember", {
+  const res = await api("/api/remember", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ text }),
@@ -100,7 +129,7 @@ async function recall() {
     results.innerHTML = RECALL_PLACEHOLDER;
     return;
   }
-  const res = await fetch(`/api/recall?q=${encodeURIComponent(q)}`);
+  const res = await api(`/api/recall?q=${encodeURIComponent(q)}`);
   const data = await res.json();
   if (!data.ok) {
     results.innerHTML = `<li class="empty-note">${escapeHtml(data.reason)}</li>`;
@@ -120,7 +149,7 @@ async function onForgetClick(e) {
   const btn = e.target.closest('[data-action="forget"]');
   if (!btn) return;
   const id = btn.closest(".memory-row").dataset.id;
-  await fetch(`/api/forget/${id}`, { method: "DELETE" });
+  await api(`/api/forget/${id}`, { method: "DELETE" });
   await Promise.all([loadStatus(), loadMemories(), recall()]);
 }
 
