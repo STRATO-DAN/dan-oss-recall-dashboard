@@ -70,7 +70,9 @@ function isLoopbackHost(hostHeader) {
 }
 
 // Fixed-window rate limiter. Single-principal tool, so one global window per limiter is the right shape.
-function makeRateLimiter({ windowMs, max }) {
+// Exported (pure, no side effects beyond its own closure) so tests can exercise the window-boundary
+// reset with a short, controllable windowMs, rather than a real 60s wait against the live server.
+export function makeRateLimiter({ windowMs, max }) {
   let windowStart = Date.now();
   let count = 0;
   return () => {
