@@ -26,6 +26,24 @@ test("remember() rejects empty text with a real error, stores nothing", async ()
   });
 });
 
+test("CONCURRENCY: overlapping remember() calls all persist to the sidecar — no rename race, no lost update", async () => {
+  await withStore(async (store) => {
+    const N = 25;
+    // Before serialization every save shared ONE `.<pid>.tmp` path, so concurrent writers could race the
+    // rename and/or lose an update (whichever rename lands last wins the file, even with a staler list).
+    await Promise.all(Array.from({ length: N }, (_, i) => store.remember(`concurrent memory number ${i}`)));
+    assert.equal(store.list().length, N, "all concurrent writes are held in memory");
+    // Reload the sidecar in a fresh store — proves every write is durably ON DISK, not just in RAM.
+    const reloaded = new MemoryStore(store.dataDir);
+    await reloaded.init();
+    assert.equal(
+      reloaded.list().length,
+      N,
+      "every concurrently-remembered item is durably persisted — no update lost to a shared-temp-file collision",
+    );
+  });
+});
+
 test("recall() with no memories returns an empty, honest result, not an error", async () => {
   await withStore(async (store) => {
     const result = await store.recall("anything");
