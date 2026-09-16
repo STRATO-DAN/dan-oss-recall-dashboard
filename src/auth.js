@@ -35,13 +35,18 @@ export function loadOrCreateToken(dataDir) {
   return token;
 }
 
-/** Constant-time bearer check — true iff the request carries exactly this token. */
+/** Constant-time bearer check — true iff the request carries exactly this token. Parses the header by a
+ *  fixed prefix rather than a regex: the Authorization header is attacker-controlled and reached BEFORE
+ *  auth passes, so a backtracking pattern like /^Bearer\s+(.+)$/ (where \s and . both match a space) is a
+ *  ReDoS an unauthenticated caller could trip. Prefix slicing + trim is strictly linear. */
 export function bearerOk(req, token) {
   const header = req.headers["authorization"];
   if (!header || typeof header !== "string") return false;
-  const m = header.match(/^Bearer\s+(.+)$/i);
-  if (!m) return false;
-  const got = Buffer.from(m[1].trim());
+  const PREFIX = "bearer ";
+  if (header.length < PREFIX.length || header.slice(0, PREFIX.length).toLowerCase() !== PREFIX) {
+    return false;
+  }
+  const got = Buffer.from(header.slice(PREFIX.length).trim());
   const want = Buffer.from(token);
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }

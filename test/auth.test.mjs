@@ -59,6 +59,9 @@ test("privileged ops are REFUSED without the bearer token (read, write, delete â
     assert.equal((await req(port, "GET", "/api/status")).status, 401);
     // a wrong token is also refused
     assert.equal((await req(port, "GET", "/api/memories", { token: "not-the-token" })).status, 401);
+    // a pathological header ("Bearer " + a flood of spaces) is refused FAST â€” no ReDoS on the pre-auth path
+    // (kept under Node's default max header size; the parser is regex-free so it stays linear regardless).
+    assert.equal((await req(port, "GET", "/api/memories", { token: " ".repeat(2000) })).status, 401);
   } finally {
     server.closeAllConnections?.(); server.close();
   }
