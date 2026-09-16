@@ -42,23 +42,29 @@ npx @strato-dan/recall-dashboard
 The CLI prints a URL carrying your access token — open **that** URL and the dashboard is authenticated.
 Type something into **Remember**, then search for it in **Recall**.
 
-### Access token (v0.2)
+### Access (v0.3 — per-principal keys)
 
-Every `/api/` operation requires the instance **bearer token**. It's generated on first run (nothing to
-configure), stored `0600` in the data dir, printed at startup, and overridable with `RECALL_TOKEN` for
-agents/CI. Loopback + a DNS-rebind guard say *where* a request came from; the token says the caller is
-authorized to touch your memories.
+Every `/api/` operation requires a **per-principal API key**. The auto-generated instance token (still `0600`
+in the data dir, printed at startup, `RECALL_TOKEN` override) is the **admin** key. The admin mints a key per
+agent so the server records *which* principal created each memory — not just "someone with the token":
 
 ```bash
-export RECALL_TOKEN="$(cat .dan-oss-recall-dashboard/recall-token)"   # or set your own before launch
-curl -X POST http://127.0.0.1:4872/api/remember -H "authorization: Bearer $RECALL_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"text":"the deploy key rotates every 90 days","source":"my-script"}'
-curl -H "authorization: Bearer $RECALL_TOKEN" 'http://127.0.0.1:4872/api/recall?q=deploy%20key'
+export RECALL_TOKEN="$(cat .dan-oss-recall-dashboard/recall-token)"   # the admin key
+
+# mint a key for one agent (the apiKey is shown ONCE)
+curl -X POST http://127.0.0.1:4872/api/principals -H "authorization: Bearer $RECALL_TOKEN" \
+  -H 'content-type: application/json' -d '{"name":"my-agent"}'
+# → { "ok": true, "principal": { "id": "p_…", "name": "my-agent", "apiKey": "…" } }
+
+# that agent stores a memory — its provenance.principal is set by the server, not the caller
+curl -X POST http://127.0.0.1:4872/api/remember -H "authorization: Bearer <my-agent apiKey>" \
+  -H 'content-type: application/json' -d '{"text":"the deploy key rotates every 90 days"}'
+curl -H "authorization: Bearer <my-agent apiKey>" 'http://127.0.0.1:4872/api/recall?q=deploy%20key'
 ```
 
-Optional `source` (or an `X-Recall-Source` header) is recorded as **provenance** on the memory, so a
-later consumer can tell where a memory came from before it re-enters an agent's context.
+Agents/CI can also be provisioned out of band with `RECALL_PRINCIPALS="my-agent:<key>,ci:<key>"`. A
+memory's `provenance.principal` is the **verified** creator (unforgeable); an optional `source` label is
+recorded separately and treated as untrusted.
 
 ## Two real modes, never blended
 
@@ -160,22 +166,36 @@ local-embedding feature that pulls in `@huggingface/transformers` → a vulnerab
 calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functionality it needs
 (connect, create table, vector search, delete) without dragging in that chain.
 
-## Security model (v0.2)
+## Security model (v0.3)
 
-- **Bearer token on every `/api/` op** — auto-generated, `0600`, `RECALL_TOKEN` override. Locality is not
-  identity; the token is. Closes unauthenticated read / write / delete / enumerate.
-- **Provenance + audit** — each write records a server-set `{source, at}`; writes, deletes, and auth
-  failures are appended to `audit.log`. In an agentic setup, stored memory becomes future context, so
-  knowing *who* wrote a memory is a security property, not a nicety.
+- **Per-principal API keys** — the API resolves each request's key to a *verified principal*, not just "someone
+  holding a shared token." The bootstrap **admin** key is the auto-generated instance token (`0600`,
+  `RECALL_TOKEN` override); the admin mints per-agent keys (`POST /api/principals` → a key shown once, stored
+  only as a hash). Keys can also be declared out-of-band with `RECALL_PRINCIPALS="agent-a:key,agent-b:key"`.
+  Closes unauthenticated read / write / delete / enumerate — and tells the three agents sharing one instance
+  apart.
+- **Verified provenance** — each memory's `provenance.principal` is the **authenticated** caller, server-set and
+  **unforgeable**: a caller cannot label a memory as a different agent (a free-text `source` label is recorded
+  separately and treated as untrusted). This closes the attribution-laundering / memory-poisoning vector —
+  stored memory becomes future model context, so *who created it* is a real security property.
+- **Owner-scoped delete** — a memory is owned by its creating principal; `forget` requires the owner or an
+  admin (→ 403 otherwise). Read/list is a shared pool, every item labelled with its verified owner.
+- **Storage invariant** — the quota accounts for the **full footprint** (text + metadata + provenance +
+  embedding vector), not just text, so metadata bloat or vector overhead can't slip past
+  `RECALL_MAX_TOTAL_BYTES`. Recall treats the sidecar as the source of truth and drops any stale index id, so a
+  best-effort LanceDB delete that failed can never surface a deleted memory.
+- **Audit** — writes, deletes, auth failures, principal changes, and 403s are appended to `audit.log`, each with
+  the acting principal.
 - **Rate limits + quotas** — per-window request and write caps, plus memory-count and total-byte limits
   (`RECALL_RATE_MAX`, `RECALL_WRITE_MAX`, `RECALL_MAX_MEMORIES`, `RECALL_MAX_TOTAL_BYTES`) bound abuse and
   external-embedding cost.
 - **DNS-rebind guard + loopback bind** — a web page can't rebind a hostname to `127.0.0.1` to reach the API.
-- **Honest limit:** a process running as the **same OS user** can read the token file — and the data —
-  directly; no app-layer auth changes that on a local file-backed tool. The token defends the browser
-  vector, other OS users, and gives provenance/audit/quota. For multi-tenant or untrusted-caller use, that
-  is out of scope for this local tier. The store is plaintext JSON — rely on OS/disk encryption for
-  at-rest protection.
+- **Honest limits:** a process running as the **same OS user** can read the key/data files directly — no
+  app-layer auth changes that on a local file-backed tool; per-principal keys defend the browser vector, other
+  OS users, and give *unforgeable* provenance + owner-scoped delete + audit. Read/list is a **shared pool**
+  (every item labelled with its verified owner), not per-principal isolation; full multi-org isolation and
+  at-rest encryption are out of scope for this local tier (the store is plaintext JSON — rely on OS/disk
+  encryption).
 
 ## What it never does
 
@@ -212,8 +232,8 @@ The test suite is Node's own built-in runner (`node --test`) — no test framewo
 ```console
 $ npm test
 ...
-# tests 27
-# pass 27
+# tests 33
+# pass 33
 # fail 0
 ```
 

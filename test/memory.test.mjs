@@ -100,16 +100,30 @@ test("quota (v0.2): remember() rejects with QuotaError once the count limit is h
   }
 });
 
-test("quota (v0.2): a total-bytes limit rejects oversize writes and forget() frees the budget", async () => {
+test("quota (v0.3): the total-bytes limit rejects oversize writes and forget() frees the exact footprint", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-quota-"));
-  const store = new MemoryStore(dir, { maxTotalBytes: 20 });
+  const store = new MemoryStore(dir, { maxTotalBytes: 1500 });
   await store.init();
   try {
-    const m = await store.remember("0123456789"); // 10 bytes, ok
-    await assert.rejects(() => store.remember("this is well over twenty bytes"), QuotaError);
-    await store.forget(m.id); // frees the 10 bytes
-    await store.remember("0123456789"); // fits again
+    const m = await store.remember("x".repeat(1000)); // ~1000-byte text + small metadata/provenance, fits
+    await assert.rejects(() => store.remember("y".repeat(1000)), QuotaError); // second would exceed 1500
+    await store.forget(m.id); // frees the full footprint
+    await store.remember("z".repeat(1000)); // fits again
     assert.equal(store.list().length, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("quota (v0.3): caller metadata counts toward the storage limit (not just text)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-quota-md-"));
+  const store = new MemoryStore(dir, { maxTotalBytes: 400 });
+  await store.init();
+  try {
+    // tiny text, but large caller-controlled metadata — in v0.2 (text-only accounting) this slipped past;
+    // v0.3 counts the full footprint, so it is correctly rejected.
+    await assert.rejects(() => store.remember("hi", { blob: "m".repeat(1000) }), QuotaError);
+    assert.equal(store.list().length, 0);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -123,4 +137,34 @@ test("provenance (v0.2): a memory records server-set provenance {source, at}", a
     const listed = store.list()[0];
     assert.equal(listed.provenance.source, "agent-Z");
   });
+});
+
+test("crash/recovery (v0.3): recall drops a stale index id the sidecar no longer has (sidecar is source of truth)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-crash-"));
+  const savedKey = process.env.OPENAI_API_KEY;
+  try {
+    const store = new MemoryStore(dir);
+    await store.init();
+    const m = await store.remember("real memory about deploy keys"); // BM25 mode — no embedding call
+    // Now simulate a diverged index: enable the hybrid path and have the vector ranker return a GHOST id the
+    // sidecar no longer has (a best-effort LanceDB delete that failed to remove it). embed() is never called —
+    // _vectorRank is stubbed wholesale.
+    process.env.OPENAI_API_KEY = "unused-in-this-test";
+    store.memories[0].hasVector = true;
+    store._vectorRank = async () => [
+      { id: "ghost-deleted-id", rank: 1, distance: 0.01 },
+      { id: m.id, rank: 2, distance: 0.5 },
+    ];
+    const result = await store.recall("deploy keys", 5);
+    assert.equal(result.mode, "hybrid");
+    const ids = result.results.map((r) => r.id);
+    assert.ok(!ids.includes("ghost-deleted-id"), "a stale index id must be dropped, not surfaced");
+    assert.ok(ids.includes(m.id), "the real, present memory is still returned");
+    // and no malformed, id-less result leaked through
+    assert.ok(result.results.every((r) => r.id && r.text), "every result carries real id + text from the sidecar");
+  } finally {
+    if (savedKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = savedKey;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
