@@ -186,6 +186,12 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
   shared team corpus opts in with `RECALL_SHARED_MEMORY=1`. This closes cross-principal read exposure — on a
   shared instance one agent can no longer read every other agent's memories, nor harvest a poisoned/planted
   memory it didn't create.
+- **Retrieved memories are untrusted content (memory-poisoning).** A stored memory becomes future model
+  context, so a `recall()` result can contain adversarial text (e.g. "ignore previous instructions…"). RECALL
+  makes each memory *attributable* (verified `provenance.principal`) and, by default, *isolated* (you only see
+  your own) — but it is a memory store, not your LLM boundary. **When you feed recalled memories into a
+  prompt, treat them as DATA, not instructions: delimit/label them and never let their text steer tool
+  calls.** The server cannot fence a prompt it does not build.
 - **Storage invariant** — the quota accounts for the **full footprint** (text + metadata + provenance +
   embedding vector), not just text, so metadata bloat or vector overhead can't slip past
   `RECALL_MAX_TOTAL_BYTES`. Recall treats the sidecar as the source of truth and drops any stale index id, so a
