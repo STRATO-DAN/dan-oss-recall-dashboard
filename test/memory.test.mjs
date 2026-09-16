@@ -44,6 +44,38 @@ test("CONCURRENCY: overlapping remember() calls all persist to the sidecar — n
   });
 });
 
+test("v0.4 per-principal read isolation: recall/list are scoped to the caller by default; admin + null + shared bypass", async () => {
+  await withStore(async (store) => {
+    await store.remember("the deploy key rotates every 90 days", {}, { principal: "agent-a" });
+    await store.remember("the office wifi password is on the sticker", {}, { principal: "agent-b" });
+
+    // DEFAULT: B sees only its own — not A's.
+    assert.equal(store.list({ principal: "agent-b" }).length, 1);
+    assert.match(store.list({ principal: "agent-b" })[0].text, /wifi/);
+    assert.equal((await store.recall("deploy key rotation", 5, { principal: "agent-b" })).results.length, 0, "B cannot recall A's memory");
+    // A sees its own.
+    assert.ok((await store.recall("deploy key rotation", 5, { principal: "agent-a" })).results.length >= 1, "A recalls its own memory");
+    assert.equal(store.list({ principal: "agent-a" }).length, 1);
+    // ADMIN (operator) bypass → sees all.
+    assert.equal(store.list({ principal: "agent-b", isAdmin: true }).length, 2);
+    assert.ok((await store.recall("deploy key rotation", 5, { principal: "agent-b", isAdmin: true })).results.length >= 1);
+    // NULL principal (trusted in-process/library caller) → sees all.
+    assert.equal(store.list().length, 2);
+  });
+
+  // SHARED-MEMORY mode (operator opt-in) → the corpus is a common pool again.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "recall-shared-"));
+  const shared = new MemoryStore(dir, { sharedMemory: true });
+  await shared.init();
+  try {
+    await shared.remember("the deploy key rotates every 90 days", {}, { principal: "agent-a" });
+    assert.ok((await shared.recall("deploy key rotation", 5, { principal: "agent-b" })).results.length >= 1, "shared mode: B recalls A's memory");
+    assert.equal(shared.list({ principal: "agent-b" }).length, 1, "shared mode: B lists A's memory");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("recall() with no memories returns an empty, honest result, not an error", async () => {
   await withStore(async (store) => {
     const result = await store.recall("anything");

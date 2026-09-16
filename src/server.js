@@ -119,7 +119,7 @@ export function createServer({ dataDir }) {
         return sendJson(res, 200, {
           ok: true,
           mode: embeddingsConfigured() ? "hybrid" : "bm25",
-          count: store.list().length,
+          count: store.list({ principal: principal.id, isAdmin: principals.isAdmin(principal) }).length, // v0.4 — own count (admin: all)
           dataDir,
           principal: { id: principal.id, name: principal.name, role: principal.role },
         });
@@ -149,7 +149,11 @@ export function createServer({ dataDir }) {
         return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such principal" });
       }
       if (p === "/api/memories" && req.method === "GET") {
-        return sendJson(res, 200, { ok: true, memories: store.list() });
+        // v0.4 — per-principal read isolation: return only the caller's own memories (admin/shared → all).
+        return sendJson(res, 200, {
+          ok: true,
+          memories: store.list({ principal: principal.id, isAdmin: principals.isAdmin(principal) }),
+        });
       }
       if (p === "/api/remember" && req.method === "POST") {
         if (!writeLimit()) {
@@ -177,7 +181,12 @@ export function createServer({ dataDir }) {
         const minScoreParam = url.searchParams.get("minScore");
         const minScore = minScoreParam === null ? undefined : Number(minScoreParam);
         try {
-          const result = await store.recall(q, k, minScore === undefined ? {} : { minScore });
+          // v0.4 — per-principal read isolation: recall searches only the caller's own memories (admin/shared → all).
+          const result = await store.recall(q, k, {
+            principal: principal.id,
+            isAdmin: principals.isAdmin(principal),
+            ...(minScore === undefined ? {} : { minScore }),
+          });
           return sendJson(res, 200, { ok: true, ...result });
         } catch (err) {
           return sendJson(res, 200, { ok: false, reason: err.message });
