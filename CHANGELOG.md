@@ -3,6 +3,41 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.3.0] — 2026-09-16
+
+### Security — per-principal identity + storage integrity (next layer after v0.2)
+
+v0.2 fixed the localhost-trust gap with an instance-wide bearer token, but the server still only knew *someone
+holding the token* made a request — not **which** principal — and provenance was caller-supplied (a
+memory-poisoning vector with attribution laundering, since stored memory becomes future model context).
+
+#### Added
+- **Per-principal API keys** (RECALL's own standard, portable mechanism — zero dependency, no external identity
+  infra). Each request's key resolves to a *verified principal*. The bootstrap **admin** key is the v0.2 instance
+  token; admin mints per-agent keys via `POST /api/principals` (key shown once, stored as a hash). Also
+  `RECALL_PRINCIPALS="name:key,..."` for out-of-band provisioning.
+- **Verified, unforgeable provenance** — `provenance.principal` is the authenticated caller, server-set; a caller
+  can no longer label a memory as a different agent. (A free-text `source` label is kept but untrusted.)
+- **Owner-scoped delete** — only a memory's creating principal, or an admin, may `forget` it (→ 403).
+- Admin principal management: `GET`/`POST /api/principals`, `DELETE /api/principals/:id` (admin only).
+
+#### Fixed
+- **Storage invariant** — `RECALL_MAX_TOTAL_BYTES` now accounts for the full footprint (text + metadata +
+  provenance + embedding vector), not just text; `forget` reclaims the exact footprint. Caller metadata can no
+  longer slip past the quota.
+- **Sidecar↔index divergence** — `recall` now treats the sidecar as the source of truth and drops any stale
+  index id, so a best-effort LanceDB delete that failed can never surface a deleted memory as a malformed result.
+
+#### Changed — BREAKING
+- Provenance shape: `provenance.source` → `provenance.{principal, source}`. `forget` is now owner-scoped. The
+  v0.2 single-token setup keeps working (that token is the admin principal), but per-agent callers should use
+  their own keys.
+
+#### Notes / honest limits
+- Same-OS-user processes remain inside the boundary (they can read the key/data files directly). Read/list is a
+  **shared pool** labelled with verified owners, not per-principal isolation; multi-org isolation and at-rest
+  encryption stay out of scope for this local tier.
+
 ## [0.2.0] — 2026-09-16
 
 ### ⚠️ Security — please upgrade from 0.1.x

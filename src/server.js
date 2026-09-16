@@ -7,9 +7,9 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MemoryStore, QuotaError } from "./memory.js";
+import { MemoryStore, QuotaError, ForbiddenError } from "./memory.js";
 import { embeddingsConfigured } from "./embeddings.js";
-import { loadOrCreateToken, bearerOk } from "./auth.js";
+import { PrincipalStore } from "./principals.js";
 import { makeAudit } from "./audit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -81,9 +81,10 @@ function makeRateLimiter({ windowMs, max }) {
   };
 }
 
-export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
+export function createServer({ dataDir }) {
   const store = new MemoryStore(dataDir);
   const ready = store.init();
+  const principals = new PrincipalStore(dataDir).load();
   const audit = makeAudit(dataDir);
   const apiLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_RATE_MAX) || 600 });
   const writeLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_WRITE_MAX) || 120 });
@@ -96,13 +97,16 @@ export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
       return;
     }
     const p = url.pathname;
+    let principal = null;
 
     try {
       if (p.startsWith("/api/")) {
-        // 🔴 AUTH (v0.2) — every privileged op requires the instance bearer token. Locality is not identity.
-        if (!bearerOk(req, token)) {
+        // 🔴 AUTH (v0.3) — every privileged op resolves the caller's API key to a VERIFIED principal. Locality
+        // is not identity, and neither is bare possession of one shared token — the server records WHICH one.
+        principal = principals.authenticate(req);
+        if (!principal) {
           audit({ action: "auth-failure", path: p, method: req.method });
-          return sendJson(res, 401, { ok: false, reason: "unauthorized — missing or invalid bearer token" });
+          return sendJson(res, 401, { ok: false, reason: "unauthorized — missing or invalid API key" });
         }
         if (!apiLimit()) {
           return sendJson(res, 429, { ok: false, reason: "rate limit exceeded — slow down" });
@@ -115,7 +119,32 @@ export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
           mode: embeddingsConfigured() ? "hybrid" : "bm25",
           count: store.list().length,
           dataDir,
+          principal: { id: principal.id, name: principal.name, role: principal.role },
         });
+      }
+
+      // Admin-only principal management (v0.3) — mint/list/remove per-agent API keys.
+      if (p === "/api/principals" && req.method === "GET") {
+        if (!principals.isAdmin(principal)) return sendJson(res, 403, { ok: false, reason: "admin only" });
+        return sendJson(res, 200, { ok: true, principals: principals.list() });
+      }
+      if (p === "/api/principals" && req.method === "POST") {
+        if (!principals.isAdmin(principal)) return sendJson(res, 403, { ok: false, reason: "admin only" });
+        const body = await readBody(req);
+        try {
+          const created = principals.create(body.name); // apiKey is in the response ONCE
+          audit({ action: "principal-create", principal: principal.id, created: created.id, name: created.name });
+          return sendJson(res, 201, { ok: true, principal: created });
+        } catch (err) {
+          return sendJson(res, 400, { ok: false, reason: err.message });
+        }
+      }
+      const principalMatch = p.match(/^\/api\/principals\/([^/]+)$/);
+      if (principalMatch && req.method === "DELETE") {
+        if (!principals.isAdmin(principal)) return sendJson(res, 403, { ok: false, reason: "admin only" });
+        const removed = principals.remove(principalMatch[1]);
+        audit({ action: "principal-remove", principal: principal.id, removed: principalMatch[1], result: removed });
+        return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such principal" });
       }
       if (p === "/api/memories" && req.method === "GET") {
         return sendJson(res, 200, { ok: true, memories: store.list() });
@@ -125,14 +154,16 @@ export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
           return sendJson(res, 429, { ok: false, reason: "write rate limit exceeded — slow down" });
         }
         const body = await readBody(req);
-        const source = String(body.source || req.headers["x-recall-source"] || "unknown").slice(0, 200);
+        const source = String(body.source || req.headers["x-recall-source"] || "").slice(0, 200);
         try {
-          const memory = await store.remember(body.text, body.metadata || {}, { source });
-          audit({ action: "remember", id: memory.id, source, bytes: Buffer.byteLength(body.text || "", "utf8") });
+          // provenance.principal is the VERIFIED caller — server-set, never from the body. The caller's own
+          // `source` label is recorded separately and treated as untrusted.
+          const memory = await store.remember(body.text, body.metadata || {}, { principal: principal.id, source });
+          audit({ action: "remember", id: memory.id, principal: principal.id, source });
           return sendJson(res, 200, { ok: true, memory });
         } catch (err) {
           if (err instanceof QuotaError) {
-            audit({ action: "remember-rejected", reason: "quota", source });
+            audit({ action: "remember-rejected", reason: "quota", principal: principal.id });
             return sendJson(res, 413, { ok: false, reason: err.message });
           }
           return sendJson(res, 200, { ok: false, reason: err.message });
@@ -152,9 +183,21 @@ export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
       }
       const forgetMatch = p.match(/^\/api\/forget\/([^/]+)$/);
       if (forgetMatch && req.method === "DELETE") {
-        const removed = await store.forget(forgetMatch[1]);
-        audit({ action: "forget", id: forgetMatch[1], result: removed ? "removed" : "no-such-memory" });
-        return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such memory" });
+        try {
+          // Owner-scoped delete — only the memory's creating principal, or an admin, may forget it.
+          const removed = await store.forget(forgetMatch[1], {
+            principal: principal.id,
+            isAdmin: principals.isAdmin(principal),
+          });
+          audit({ action: "forget", id: forgetMatch[1], principal: principal.id, result: removed ? "removed" : "no-such-memory" });
+          return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such memory" });
+        } catch (err) {
+          if (err instanceof ForbiddenError) {
+            audit({ action: "forget-denied", id: forgetMatch[1], principal: principal.id });
+            return sendJson(res, 403, { ok: false, reason: err.message });
+          }
+          throw err;
+        }
       }
 
       if (req.method === "GET" && !p.startsWith("/api/")) return serveStatic(res, p);
@@ -164,7 +207,8 @@ export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
     }
   });
 
-  server.recallToken = token; // so the CLI can print it; tests read it to authenticate
+  server.recallToken = principals.adminKey; // the admin bootstrap key; the CLI prints it, tests read it
+  server.principals = principals; // exposed for tests
   return server;
 }
 

@@ -32,6 +32,29 @@ export class QuotaError extends Error {
   }
 }
 
+// Thrown when a principal tries to delete a memory it does not own — the server maps it to HTTP 403.
+export class ForbiddenError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ForbiddenError";
+  }
+}
+
+// The full stored footprint of a memory (v0.3) — NOT just its text. Counts the caller-controllable text +
+// metadata + provenance, plus the embedding vector (the largest per-memory cost in hybrid mode). This is what
+// the storage quota accounts against, so metadata bloat or the vector overhead can no longer slip past it.
+function memoryBytes({ text = "", metadata = {}, provenance = {}, vector = null }) {
+  let n = Buffer.byteLength(text, "utf8");
+  try {
+    n += Buffer.byteLength(JSON.stringify(metadata) || "", "utf8");
+    n += Buffer.byteLength(JSON.stringify(provenance) || "", "utf8");
+  } catch {
+    /* non-serializable metadata is rejected elsewhere; count conservatively */
+  }
+  if (Array.isArray(vector)) n += vector.length * 8; // float64 per dimension
+  return n;
+}
+
 // Exact cosine similarity between two equal-length vectors. Pure arithmetic, zero dependency — the
 // fallback vector engine used when LanceDB's native package isn't available on the host.
 export function cosineSimilarity(a, b) {
@@ -82,7 +105,7 @@ export class MemoryStore {
       }
       this.memories = [];
     }
-    this.totalBytes = this.memories.reduce((n, m) => n + Buffer.byteLength(m.text || "", "utf8"), 0);
+    this.totalBytes = this.memories.reduce((n, m) => n + memoryBytes(m), 0);
     if (embeddingsConfigured() && this.memories.some((m) => m.hasVector)) {
       await this._openTable(); // best-effort; returns null (→ JS fallback) if LanceDB is unavailable
     }
@@ -127,7 +150,7 @@ export class MemoryStore {
   // array is never leaked out through the API — strip it from anything returned to a caller.
   static _public(m) {
     if (!m) return m;
-    const { vector, ...rest } = m;
+    const { vector, _bytes, ...rest } = m;
     return rest;
   }
 
@@ -135,13 +158,17 @@ export class MemoryStore {
     if (!text || !text.trim()) {
       throw new Error("Nothing real to remember — text is empty.");
     }
-    // Quota (v0.2) — reject BEFORE any external embedding call, so a runaway/unauthorized caller can
-    // neither grow the store nor amplify OpenAI cost past the configured bounds.
-    const bytes = Buffer.byteLength(text, "utf8");
+    // Quota (v0.3) — account for the FULL footprint (text + metadata + provenance + the vector estimate when
+    // embeddings are on), not just text, and reject BEFORE any external embedding call so a runaway/unauthorized
+    // caller can neither grow the store (via text OR metadata) nor amplify OpenAI cost past the configured bound.
+    const VECTOR_BYTES_ESTIMATE = embeddingsConfigured() ? 1536 * 8 : 0; // typical embedding dim; refined post-embed
+    const estBytes =
+      memoryBytes({ text, metadata, provenance: { principal: provenance.principal, source: provenance.source } }) +
+      VECTOR_BYTES_ESTIMATE;
     if (this.memories.length >= this.maxCount) {
       throw new QuotaError(`memory count limit reached (${this.maxCount}) — nothing stored`);
     }
-    if (this.totalBytes + bytes > this.maxTotalBytes) {
+    if (this.totalBytes + estBytes > this.maxTotalBytes) {
       throw new QuotaError(`total storage limit reached (${this.maxTotalBytes} bytes) — nothing stored`);
     }
     const id = crypto.randomUUID();
@@ -178,21 +205,26 @@ export class MemoryStore {
       }
     }
 
-    // Provenance (v0.2) — server-set, NOT caller-asserted: `source` is a free label the authenticated
-    // caller may pass (recorded for attribution), `at` is the server's own timestamp. `metadata` stays
-    // caller-controlled and is treated as untrusted; provenance is the field a consumer can rely on to
-    // tell WHERE a memory came from before it re-enters model context.
+    // Provenance (v0.3) — `principal` is the VERIFIED authenticated principal set by the server, NOT the
+    // caller; it is the unforgeable owner of this memory and the answer to "who created it" before it re-enters
+    // model context. `source` is a free label the caller may pass (recorded, untrusted). `metadata` stays
+    // caller-controlled and untrusted.
     const memory = {
       id,
       text,
       metadata,
-      provenance: { source: String(provenance.source || "unknown").slice(0, 200), at: createdAt },
+      provenance: {
+        principal: String(provenance.principal || "unknown").slice(0, 120),
+        source: String(provenance.source || "").slice(0, 200),
+        at: createdAt,
+      },
       createdAt,
       hasVector,
     };
     if (hasVector) memory.vector = vector;
+    memory._bytes = memoryBytes(memory); // exact footprint, so forget() reclaims precisely what remember() added
     this.memories.push(memory);
-    this.totalBytes += bytes;
+    this.totalBytes += memory._bytes;
     await this._saveSidecar();
     return MemoryStore._public(memory);
   }
@@ -270,17 +302,24 @@ export class MemoryStore {
     const fused = MemoryStore._rrfCombine(bm25Ranked, vectorRanked);
     const results = fused
       .filter((r) => r.rrf >= minScore)
+      // 🔴 v0.3 — the sidecar is the source of truth. Drop any id it no longer has (a stale LanceDB entry left
+      // by a best-effort delete that failed) BEFORE mapping, so a diverged index can never surface a deleted
+      // memory as a malformed, id-less result.
+      .filter((r) => byId.has(r.id))
       .slice(0, k)
       .map((r) => ({ ...MemoryStore._public(byId.get(r.id)), score: r.rrf, bm25Score: r.bm25Score, vectorDistance: r.vectorDistance }));
     return { mode: "hybrid", results };
   }
 
-  async forget(id) {
-    const before = this.memories.length;
+  async forget(id, { principal, isAdmin = false } = {}) {
     const removed = this.memories.find((m) => m.id === id);
+    if (!removed) return false;
+    // Owner-scoped delete (v0.3): only the principal that created the memory — or an admin — may forget it.
+    if (principal !== undefined && !isAdmin && removed.provenance?.principal !== principal) {
+      throw new ForbiddenError("this memory belongs to another principal — only its owner or an admin may forget it");
+    }
     this.memories = this.memories.filter((m) => m.id !== id);
-    if (this.memories.length === before) return false;
-    if (removed) this.totalBytes -= Buffer.byteLength(removed.text || "", "utf8");
+    this.totalBytes -= removed._bytes ?? memoryBytes(removed);
     await this._saveSidecar();
     if (this.table) {
       try {
