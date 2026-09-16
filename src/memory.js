@@ -141,9 +141,19 @@ export class MemoryStore {
   }
 
   async _saveSidecar() {
-    const tmp = path.join(this.dataDir, `.memories.json.${process.pid}.tmp`);
-    await fs.writeFile(tmp, JSON.stringify({ memories: this.memories }, null, 2), "utf8");
-    await fs.rename(tmp, this.sidecarPath);
+    // Serialize saves. Two concurrent writers previously shared ONE temp path (`.<pid>.tmp`) and could
+    // race the rename (ENOENT/EEXIST) AND lose an update (whichever rename lands last wins the file's
+    // content). Atomic replacement is not the same as atomic concurrent persistence. Each save now (a)
+    // waits for the previous one to finish, so writes are ordered and the last one reflects the latest
+    // `this.memories`, and (b) uses a per-write unique temp name so two in-flight writers never collide.
+    const prev = this._saveChain || Promise.resolve();
+    const mine = prev.catch(() => {}).then(async () => {
+      const tmp = path.join(this.dataDir, `.memories.json.${process.pid}.${crypto.randomUUID()}.tmp`);
+      await fs.writeFile(tmp, JSON.stringify({ memories: this.memories }, null, 2), "utf8");
+      await fs.rename(tmp, this.sidecarPath);
+    });
+    this._saveChain = mine;
+    return mine;
   }
 
   // A stored memory carries its embedding vector in the sidecar (the source of truth); that big

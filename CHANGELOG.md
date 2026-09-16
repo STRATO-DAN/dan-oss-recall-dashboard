@@ -3,6 +3,16 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.3.1] — 2026-09-17
+
+### Fixed
+- **Concurrent sidecar persistence.** `_saveSidecar` used one per-process temp path
+  (`.memories.json.<pid>.tmp`), so overlapping writes shared it and could race the rename and/or lose an
+  update — the rename that lands last wins the file, even with a staler, shorter list. Atomic replacement
+  is not atomic *concurrent* persistence. Saves are now serialized (each waits for the previous, so the
+  last write reflects the latest memories) and use a per-write unique temp name, so concurrent
+  `remember()` calls all persist durably. Regression test added.
+
 ## [0.3.0] — 2026-09-16
 
 ### Security — per-principal identity + storage integrity (next layer after v0.2)
