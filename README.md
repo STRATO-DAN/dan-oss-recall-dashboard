@@ -39,14 +39,26 @@ engine.
 npx @strato-dan/recall-dashboard
 ```
 
-Opens at `http://127.0.0.1:4872` (loopback only). Type something into **Remember**, then search
-for it in **Recall**.
+The CLI prints a URL carrying your access token — open **that** URL and the dashboard is authenticated.
+Type something into **Remember**, then search for it in **Recall**.
+
+### Access token (v0.2)
+
+Every `/api/` operation requires the instance **bearer token**. It's generated on first run (nothing to
+configure), stored `0600` in the data dir, printed at startup, and overridable with `RECALL_TOKEN` for
+agents/CI. Loopback + a DNS-rebind guard say *where* a request came from; the token says the caller is
+authorized to touch your memories.
 
 ```bash
-curl -X POST http://127.0.0.1:4872/api/remember -H 'content-type: application/json' \
-  -d '{"text":"the deploy key rotates every 90 days"}'
-curl 'http://127.0.0.1:4872/api/recall?q=deploy%20key'
+export RECALL_TOKEN="$(cat .dan-oss-recall-dashboard/recall-token)"   # or set your own before launch
+curl -X POST http://127.0.0.1:4872/api/remember -H "authorization: Bearer $RECALL_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"text":"the deploy key rotates every 90 days","source":"my-script"}'
+curl -H "authorization: Bearer $RECALL_TOKEN" 'http://127.0.0.1:4872/api/recall?q=deploy%20key'
 ```
+
+Optional `source` (or an `X-Recall-Source` header) is recorded as **provenance** on the memory, so a
+later consumer can tell where a memory came from before it re-enters an agent's context.
 
 ## Two real modes, never blended
 
@@ -148,9 +160,27 @@ local-embedding feature that pulls in `@huggingface/transformers` → a vulnerab
 calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functionality it needs
 (connect, create table, vector search, delete) without dragging in that chain.
 
+## Security model (v0.2)
+
+- **Bearer token on every `/api/` op** — auto-generated, `0600`, `RECALL_TOKEN` override. Locality is not
+  identity; the token is. Closes unauthenticated read / write / delete / enumerate.
+- **Provenance + audit** — each write records a server-set `{source, at}`; writes, deletes, and auth
+  failures are appended to `audit.log`. In an agentic setup, stored memory becomes future context, so
+  knowing *who* wrote a memory is a security property, not a nicety.
+- **Rate limits + quotas** — per-window request and write caps, plus memory-count and total-byte limits
+  (`RECALL_RATE_MAX`, `RECALL_WRITE_MAX`, `RECALL_MAX_MEMORIES`, `RECALL_MAX_TOTAL_BYTES`) bound abuse and
+  external-embedding cost.
+- **DNS-rebind guard + loopback bind** — a web page can't rebind a hostname to `127.0.0.1` to reach the API.
+- **Honest limit:** a process running as the **same OS user** can read the token file — and the data —
+  directly; no app-layer auth changes that on a local file-backed tool. The token defends the browser
+  vector, other OS users, and gives provenance/audit/quota. For multi-tenant or untrusted-caller use, that
+  is out of scope for this local tier. The store is plaintext JSON — rely on OS/disk encryption for
+  at-rest protection.
+
 ## What it never does
 
 - Never listens on anything but `127.0.0.1`.
+- Never serves a privileged API operation without the bearer token.
 - Never fabricates a "semantic" result when running in BM25-only mode — the response says which
   mode answered.
 - Never returns a memory that shares zero real terms with the query in BM25 mode — a real
@@ -182,8 +212,8 @@ The test suite is Node's own built-in runner (`node --test`) — no test framewo
 ```console
 $ npm test
 ...
-# tests 20
-# pass 20
+# tests 27
+# pass 27
 # fail 0
 ```
 

@@ -23,6 +23,15 @@ import { tokenize, search as bm25Search } from "./bm25.js";
 
 const RRF_K = 60; // standard Reciprocal Rank Fusion constant (Elasticsearch's own default)
 
+// Thrown when a write would exceed a configured bound — the server maps it to HTTP 413 so an
+// unauthorized (or runaway) caller cannot grow the store, or amplify embedding cost, without limit.
+export class QuotaError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "QuotaError";
+  }
+}
+
 // Exact cosine similarity between two equal-length vectors. Pure arithmetic, zero dependency — the
 // fallback vector engine used when LanceDB's native package isn't available on the host.
 export function cosineSimilarity(a, b) {
@@ -50,12 +59,16 @@ export function cosineRank(queryVector, memories, limit) {
 }
 
 export class MemoryStore {
-  constructor(dataDir) {
+  constructor(dataDir, opts = {}) {
     this.dataDir = dataDir;
     this.sidecarPath = path.join(dataDir, "memories.json");
-    this.memories = []; // real records: { id, text, metadata, createdAt, hasVector, vector? }
+    this.memories = []; // real records: { id, text, metadata, provenance, createdAt, hasVector, vector? }
     this.table = null; // LanceDB table, when the native package is available on this host
     this._lanceMod = undefined; // undefined = not yet checked; module | null after the first check
+    // Quotas (v0.2) — bound storage growth and embedding amplification. Configurable; sane defaults.
+    this.maxCount = opts.maxCount ?? (Number(process.env.RECALL_MAX_MEMORIES) || 100000);
+    this.maxTotalBytes = opts.maxTotalBytes ?? (Number(process.env.RECALL_MAX_TOTAL_BYTES) || 512 * 1024 * 1024);
+    this.totalBytes = 0; // running sum of stored text bytes, recomputed on init
   }
 
   async init() {
@@ -69,6 +82,7 @@ export class MemoryStore {
       }
       this.memories = [];
     }
+    this.totalBytes = this.memories.reduce((n, m) => n + Buffer.byteLength(m.text || "", "utf8"), 0);
     if (embeddingsConfigured() && this.memories.some((m) => m.hasVector)) {
       await this._openTable(); // best-effort; returns null (→ JS fallback) if LanceDB is unavailable
     }
@@ -117,9 +131,18 @@ export class MemoryStore {
     return rest;
   }
 
-  async remember(text, metadata = {}) {
+  async remember(text, metadata = {}, provenance = {}) {
     if (!text || !text.trim()) {
       throw new Error("Nothing real to remember — text is empty.");
+    }
+    // Quota (v0.2) — reject BEFORE any external embedding call, so a runaway/unauthorized caller can
+    // neither grow the store nor amplify OpenAI cost past the configured bounds.
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (this.memories.length >= this.maxCount) {
+      throw new QuotaError(`memory count limit reached (${this.maxCount}) — nothing stored`);
+    }
+    if (this.totalBytes + bytes > this.maxTotalBytes) {
+      throw new QuotaError(`total storage limit reached (${this.maxTotalBytes} bytes) — nothing stored`);
     }
     const id = crypto.randomUUID();
     const createdAt = new Date().toISOString();
@@ -155,9 +178,21 @@ export class MemoryStore {
       }
     }
 
-    const memory = { id, text, metadata, createdAt, hasVector };
+    // Provenance (v0.2) — server-set, NOT caller-asserted: `source` is a free label the authenticated
+    // caller may pass (recorded for attribution), `at` is the server's own timestamp. `metadata` stays
+    // caller-controlled and is treated as untrusted; provenance is the field a consumer can rely on to
+    // tell WHERE a memory came from before it re-enters model context.
+    const memory = {
+      id,
+      text,
+      metadata,
+      provenance: { source: String(provenance.source || "unknown").slice(0, 200), at: createdAt },
+      createdAt,
+      hasVector,
+    };
     if (hasVector) memory.vector = vector;
     this.memories.push(memory);
+    this.totalBytes += bytes;
     await this._saveSidecar();
     return MemoryStore._public(memory);
   }
@@ -242,8 +277,10 @@ export class MemoryStore {
 
   async forget(id) {
     const before = this.memories.length;
+    const removed = this.memories.find((m) => m.id === id);
     this.memories = this.memories.filter((m) => m.id !== id);
     if (this.memories.length === before) return false;
+    if (removed) this.totalBytes -= Buffer.byteLength(removed.text || "", "utf8");
     await this._saveSidecar();
     if (this.table) {
       try {

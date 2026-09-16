@@ -1,12 +1,16 @@
-// Real local HTTP server, stdlib only for the HTTP layer (the one real dependency, LanceDB, is
-// used only inside memory.js). Loopback-only, same reasoning as every other DAN-OSS tool: this
-// reads/stores real memories that never need to be reachable off the local machine.
+// Real local HTTP server, stdlib only for the HTTP layer (the one real dependency, LanceDB, is used
+// only inside memory.js). Loopback-only — but as of v0.2 loopback is NOT the trust decision: every
+// privileged /api/ operation requires the instance bearer token (auth.js), is rate-limited and quota-
+// bounded, and writes/deletes/auth-failures are audited (audit.js). Static assets stay open (they are
+// not secret and the DNS-rebind guard + loopback bind already scope who can load them).
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MemoryStore } from "./memory.js";
+import { MemoryStore, QuotaError } from "./memory.js";
 import { embeddingsConfigured } from "./embeddings.js";
+import { loadOrCreateToken, bearerOk } from "./auth.js";
+import { makeAudit } from "./audit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -52,8 +56,8 @@ async function serveStatic(res, urlPath) {
   }
 }
 
-// 🔴 DNS-rebinding guard — loopback-only dashboard over stored memories; refuse any request whose Host isn't
-// loopback so a web page the user visits can't rebind a hostname to 127.0.0.1 and read/write their memories.
+// 🔴 DNS-rebinding guard — refuse any request whose Host isn't loopback so a web page the user visits
+// can't rebind a hostname to 127.0.0.1 and reach the API. (Belt-and-suspenders with the bearer token.)
 function isLoopbackHost(hostHeader) {
   if (!hostHeader) return false;
   let host = String(hostHeader).trim().toLowerCase();
@@ -65,11 +69,26 @@ function isLoopbackHost(hostHeader) {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
-export function createServer({ dataDir }) {
+// Fixed-window rate limiter. Single-principal tool, so one global window per limiter is the right shape.
+function makeRateLimiter({ windowMs, max }) {
+  let windowStart = Date.now();
+  let count = 0;
+  return () => {
+    const now = Date.now();
+    if (now - windowStart >= windowMs) { windowStart = now; count = 0; }
+    count += 1;
+    return count <= max;
+  };
+}
+
+export function createServer({ dataDir, token = loadOrCreateToken(dataDir) }) {
   const store = new MemoryStore(dataDir);
   const ready = store.init();
+  const audit = makeAudit(dataDir);
+  const apiLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_RATE_MAX) || 600 });
+  const writeLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_WRITE_MAX) || 120 });
 
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     await ready;
     const url = new URL(req.url, "http://127.0.0.1");
     if (!isLoopbackHost(req.headers.host)) {
@@ -79,6 +98,17 @@ export function createServer({ dataDir }) {
     const p = url.pathname;
 
     try {
+      if (p.startsWith("/api/")) {
+        // 🔴 AUTH (v0.2) — every privileged op requires the instance bearer token. Locality is not identity.
+        if (!bearerOk(req, token)) {
+          audit({ action: "auth-failure", path: p, method: req.method });
+          return sendJson(res, 401, { ok: false, reason: "unauthorized — missing or invalid bearer token" });
+        }
+        if (!apiLimit()) {
+          return sendJson(res, 429, { ok: false, reason: "rate limit exceeded — slow down" });
+        }
+      }
+
       if (p === "/api/status" && req.method === "GET") {
         return sendJson(res, 200, {
           ok: true,
@@ -91,11 +121,20 @@ export function createServer({ dataDir }) {
         return sendJson(res, 200, { ok: true, memories: store.list() });
       }
       if (p === "/api/remember" && req.method === "POST") {
+        if (!writeLimit()) {
+          return sendJson(res, 429, { ok: false, reason: "write rate limit exceeded — slow down" });
+        }
         const body = await readBody(req);
+        const source = String(body.source || req.headers["x-recall-source"] || "unknown").slice(0, 200);
         try {
-          const memory = await store.remember(body.text, body.metadata || {});
+          const memory = await store.remember(body.text, body.metadata || {}, { source });
+          audit({ action: "remember", id: memory.id, source, bytes: Buffer.byteLength(body.text || "", "utf8") });
           return sendJson(res, 200, { ok: true, memory });
         } catch (err) {
+          if (err instanceof QuotaError) {
+            audit({ action: "remember-rejected", reason: "quota", source });
+            return sendJson(res, 413, { ok: false, reason: err.message });
+          }
           return sendJson(res, 200, { ok: false, reason: err.message });
         }
       }
@@ -114,15 +153,19 @@ export function createServer({ dataDir }) {
       const forgetMatch = p.match(/^\/api\/forget\/([^/]+)$/);
       if (forgetMatch && req.method === "DELETE") {
         const removed = await store.forget(forgetMatch[1]);
+        audit({ action: "forget", id: forgetMatch[1], result: removed ? "removed" : "no-such-memory" });
         return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such memory" });
       }
 
-      if (req.method === "GET") return serveStatic(res, p);
+      if (req.method === "GET" && !p.startsWith("/api/")) return serveStatic(res, p);
       res.writeHead(404).end("not found");
     } catch (err) {
       sendJson(res, 500, { ok: false, reason: err.message });
     }
   });
+
+  server.recallToken = token; // so the CLI can print it; tests read it to authenticate
+  return server;
 }
 
 export function listen(port, dataDir) {

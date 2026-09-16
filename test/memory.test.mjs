@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { MemoryStore } from "../src/memory.js";
+import { MemoryStore, QuotaError } from "../src/memory.js";
 
 async function withStore(fn) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-test-"));
@@ -84,5 +84,43 @@ test("recall() respects k, returning at most that many results", async () => {
     }
     const result = await store.recall("deploy key", 2);
     assert.equal(result.results.length, 2);
+  });
+});
+
+test("quota (v0.2): remember() rejects with QuotaError once the count limit is hit — before any store growth", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-quota-"));
+  const store = new MemoryStore(dir, { maxCount: 1 });
+  await store.init();
+  try {
+    await store.remember("first is fine");
+    await assert.rejects(() => store.remember("second exceeds the count limit"), QuotaError);
+    assert.equal(store.list().length, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("quota (v0.2): a total-bytes limit rejects oversize writes and forget() frees the budget", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-quota-"));
+  const store = new MemoryStore(dir, { maxTotalBytes: 20 });
+  await store.init();
+  try {
+    const m = await store.remember("0123456789"); // 10 bytes, ok
+    await assert.rejects(() => store.remember("this is well over twenty bytes"), QuotaError);
+    await store.forget(m.id); // frees the 10 bytes
+    await store.remember("0123456789"); // fits again
+    assert.equal(store.list().length, 1);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("provenance (v0.2): a memory records server-set provenance {source, at}", async () => {
+  await withStore(async (store) => {
+    const m = await store.remember("hello", {}, { source: "agent-Z" });
+    assert.equal(m.provenance.source, "agent-Z");
+    assert.ok(m.provenance.at);
+    const listed = store.list()[0];
+    assert.equal(listed.provenance.source, "agent-Z");
   });
 });
