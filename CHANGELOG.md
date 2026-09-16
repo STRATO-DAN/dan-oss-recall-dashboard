@@ -3,6 +3,16 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.4.0] — 2026-09-17
+
+### ⚠️ Behaviour change — reads are now per-principal
+- **Per-principal read isolation.** `recall()` and `GET /api/memories` now return only the **calling
+  principal's own memories** by default. Authentication has known *which* principal is asking since v0.3, but
+  authorization didn't follow on reads — any authenticated principal could read the entire corpus (and harvest
+  a poisoned/planted memory it didn't create). Now it does. An **admin** (the instance operator) and a trusted
+  in-process/library caller still see all; owner-scoped delete is unchanged. **If you relied on shared
+  read/recall across principals, opt back in with `RECALL_SHARED_MEMORY=1`.**
+
 ## [0.3.1] — 2026-09-17
 
 ### Fixed

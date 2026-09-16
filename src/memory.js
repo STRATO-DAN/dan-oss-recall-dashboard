@@ -92,6 +92,21 @@ export class MemoryStore {
     this.maxCount = opts.maxCount ?? (Number(process.env.RECALL_MAX_MEMORIES) || 100000);
     this.maxTotalBytes = opts.maxTotalBytes ?? (Number(process.env.RECALL_MAX_TOTAL_BYTES) || 512 * 1024 * 1024);
     this.totalBytes = 0; // running sum of stored text bytes, recomputed on init
+    // v0.4 — per-principal READ isolation. By DEFAULT a principal's reads/searches see only the memories
+    // it created (its verified provenance.principal). An operator who genuinely wants one shared team
+    // corpus opts in explicitly via RECALL_SHARED_MEMORY. Authentication already told the server WHICH
+    // principal is asking (v0.3); this makes authorization follow identity on reads too, so one shared
+    // instance no longer hands every principal every other principal's memories.
+    this.sharedMemory = opts.sharedMemory ?? /^(1|true|yes|on)$/i.test(process.env.RECALL_SHARED_MEMORY || "");
+  }
+
+  /** Can `principal` read `memory`? Shared-memory mode → everyone; an admin (the instance operator) →
+   *  everyone, matching forget()'s existing isAdmin bypass; otherwise only the creating principal.
+   *  `principal == null` is a trusted in-process/library caller (no HTTP identity) and sees everything —
+   *  the server ALWAYS passes the authenticated principal, so a non-admin API caller is always scoped. */
+  _canRead(memory, principal, isAdmin = false) {
+    if (this.sharedMemory || isAdmin || principal == null) return true;
+    return memory?.provenance?.principal === principal;
   }
 
   async init() {
@@ -292,7 +307,7 @@ export class MemoryStore {
    * applied to the actual BM25 score (0 = shares no term with the query, the corpus-derived floor);
    * in hybrid mode a memory only needs to be found by BM25 OR the vector search to rank at all, so
    * `minScore` filters on the fused RRF score. Either way: return what actually scored. */
-  async recall(query, k = 5, { minScore = 0 } = {}) {
+  async recall(query, k = 5, { minScore = 0, principal = null, isAdmin = false } = {}) {
     if (!query || !query.trim()) {
       return { mode: "none", results: [] };
     }
@@ -303,6 +318,8 @@ export class MemoryStore {
     if (!hybridAvailable) {
       const results = bm25Ranked
         .filter((r) => r.score >= minScore)
+        // v0.4 — per-principal read isolation: a caller only recalls its OWN memories unless shared mode.
+        .filter((r) => this._canRead(byId.get(r.id), principal, isAdmin))
         .slice(0, k)
         .map((r) => ({ ...MemoryStore._public(byId.get(r.id)), score: r.score }));
       return { mode: "bm25", results };
@@ -316,6 +333,8 @@ export class MemoryStore {
       // by a best-effort delete that failed) BEFORE mapping, so a diverged index can never surface a deleted
       // memory as a malformed, id-less result.
       .filter((r) => byId.has(r.id))
+      // v0.4 — per-principal read isolation (applied after the source-of-truth filter, before k-slice).
+      .filter((r) => this._canRead(byId.get(r.id), principal, isAdmin))
       .slice(0, k)
       .map((r) => ({ ...MemoryStore._public(byId.get(r.id)), score: r.rrf, bm25Score: r.bm25Score, vectorDistance: r.vectorDistance }));
     return { mode: "hybrid", results };
@@ -341,8 +360,10 @@ export class MemoryStore {
     return true;
   }
 
-  list() {
-    return [...this.memories]
+  list({ principal = null, isAdmin = false } = {}) {
+    return this.memories
+      // v0.4 — per-principal read isolation: list only the caller's own memories unless shared mode.
+      .filter((m) => this._canRead(m, principal, isAdmin))
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .map((m) => MemoryStore._public(m));
   }

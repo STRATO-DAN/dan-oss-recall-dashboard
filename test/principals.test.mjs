@@ -74,6 +74,32 @@ test("provenance is the VERIFIED principal — a caller cannot forge it via sour
   }
 });
 
+test("v0.4 read isolation (HTTP): a principal recalls/lists ONLY its own; another principal can't; admin sees all", async () => {
+  const { server, port, adminKey } = await start();
+  try {
+    const a = await mkPrincipal(port, adminKey, "agent-a");
+    const b = await mkPrincipal(port, adminKey, "agent-b");
+    await req(port, "POST", "/api/remember", { token: a.apiKey, body: { text: "A secret: the deploy key rotates every 90 days" } });
+    await req(port, "POST", "/api/remember", { token: b.apiKey, body: { text: "B note: the office wifi password" } });
+
+    // B lists → sees ONLY its own; A's memory is absent.
+    const bList = await req(port, "GET", "/api/memories", { token: b.apiKey });
+    assert.equal(bList.json.memories.length, 1);
+    assert.match(bList.json.memories[0].text, /office wifi/);
+    // B recalls A's topic → nothing (A's memory is invisible to B).
+    const bRecall = await req(port, "GET", "/api/recall?q=deploy%20key%20rotation", { token: b.apiKey });
+    assert.equal(bRecall.json.results.length, 0, "B must not recall A's memory");
+    // A recalls its own → finds it.
+    const aRecall = await req(port, "GET", "/api/recall?q=deploy%20key%20rotation", { token: a.apiKey });
+    assert.ok(aRecall.json.results.some((r) => /deploy key/.test(r.text)), "A recalls its own memory");
+    // Admin (operator) → sees both.
+    const adminList = await req(port, "GET", "/api/memories", { token: adminKey });
+    assert.equal(adminList.json.memories.length, 2, "admin sees all memories");
+  } finally {
+    stop(server);
+  }
+});
+
 test("delete is owner-scoped: another member gets 403; the owner and the admin can forget", async () => {
   const { server, port, adminKey } = await start();
   try {

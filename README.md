@@ -179,7 +179,13 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
   separately and treated as untrusted). This closes the attribution-laundering / memory-poisoning vector —
   stored memory becomes future model context, so *who created it* is a real security property.
 - **Owner-scoped delete** — a memory is owned by its creating principal; `forget` requires the owner or an
-  admin (→ 403 otherwise). Read/list is a shared pool, every item labelled with its verified owner.
+  admin (→ 403 otherwise).
+- **Per-principal read isolation (v0.4)** — `recall`/`list` return only the calling principal's **own** memories
+  by default: authorization follows the identity that authentication already established. An **admin** (the
+  instance operator) and a trusted in-process/library caller see all; an operator who genuinely wants one
+  shared team corpus opts in with `RECALL_SHARED_MEMORY=1`. This closes cross-principal read exposure — on a
+  shared instance one agent can no longer read every other agent's memories, nor harvest a poisoned/planted
+  memory it didn't create.
 - **Storage invariant** — the quota accounts for the **full footprint** (text + metadata + provenance +
   embedding vector), not just text, so metadata bloat or vector overhead can't slip past
   `RECALL_MAX_TOTAL_BYTES`. Recall treats the sidecar as the source of truth and drops any stale index id, so a
@@ -192,10 +198,10 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
 - **DNS-rebind guard + loopback bind** — a web page can't rebind a hostname to `127.0.0.1` to reach the API.
 - **Honest limits:** a process running as the **same OS user** can read the key/data files directly — no
   app-layer auth changes that on a local file-backed tool; per-principal keys defend the browser vector, other
-  OS users, and give *unforgeable* provenance + owner-scoped delete + audit. Read/list is a **shared pool**
-  (every item labelled with its verified owner), not per-principal isolation; full multi-org isolation and
-  at-rest encryption are out of scope for this local tier (the store is plaintext JSON — rely on OS/disk
-  encryption).
+  OS users, and give *unforgeable* provenance + owner-scoped delete + audit + **per-principal read isolation**.
+  Reads are **per-principal by default** (`RECALL_SHARED_MEMORY=1` opts into a shared team corpus; admin sees
+  all); full multi-org isolation and at-rest encryption are out of scope for this local tier (the store is
+  plaintext JSON — rely on OS/disk encryption).
 
 ## What it never does
 
