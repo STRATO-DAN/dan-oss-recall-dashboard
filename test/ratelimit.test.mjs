@@ -73,6 +73,34 @@ test("hitting the write limit does not consume the general api limit, and vice v
   }
 });
 
+test("R6: the api rate limit is PER-PRINCIPAL — one principal's burst does not 429 another (no cross-principal DoS)", async () => {
+  const { server, port, token, dataDir } = await start({ RECALL_RATE_MAX: "3" });
+  try {
+    const alice = (await req(port, "POST", "/api/principals", { token, body: { name: "alice" } })).json.principal;
+    const bob = (await req(port, "POST", "/api/principals", { token, body: { name: "bob" } })).json.principal;
+    // Alice bursts past her own window...
+    const aliceCodes = [];
+    for (let i = 0; i < 5; i++) aliceCodes.push((await req(port, "GET", "/api/status", { token: alice.apiKey })).status);
+    assert.ok(aliceCodes.includes(429), "alice is throttled once she exceeds her OWN window");
+    // ...bob's very first request still succeeds — his window is independent of alice's (and of the admin's).
+    assert.equal((await req(port, "GET", "/api/status", { token: bob.apiKey })).status, 200,
+      "bob is unaffected by alice's burst — the limiter keys per principal");
+  } finally {
+    stop(server);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: makeRateLimiter keys independently — one key's exhaustion leaves another key's budget intact", () => {
+  const limit = makeRateLimiter({ windowMs: 10_000, max: 2 });
+  assert.equal(limit("alice"), true);
+  assert.equal(limit("alice"), true);
+  assert.equal(limit("alice"), false, "alice is exhausted");
+  assert.equal(limit("bob"), true, "bob still has his full, independent budget");
+  assert.equal(limit("bob"), true);
+  assert.equal(limit("bob"), false);
+});
+
 test("BOUNDARY: the fixed window resets exactly at its edge — a caller is not permanently locked out", async () => {
   // The server always uses a real 60s window (not env-configurable), so the reset boundary is tested
   // directly against the exported limiter with a short, controllable window — deterministic and fast,

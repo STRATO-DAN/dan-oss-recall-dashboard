@@ -21,7 +21,12 @@ export async function embed(text) {
     body: JSON.stringify({ model: MODEL, input: text }),
   });
   if (!res.ok) {
-    throw new Error(`OpenAI embeddings API error ${res.status}: ${await res.text()}`);
+    // R10 — do NOT put the provider's raw response body into the thrown error: it can echo request content or
+    // upstream internals and would otherwise be reflected out through the API. Log it locally for the operator
+    // (loopback-only), surface only the status to any caller.
+    const detail = await res.text().catch(() => "");
+    if (detail) console.error(`[DAN] RECALL DASHBOARD: OpenAI embeddings API error ${res.status}: ${detail.slice(0, 500)}`);
+    throw new Error(`OpenAI embeddings API error ${res.status}`);
   }
   const data = await res.json();
   const vector = data.data?.[0]?.embedding;

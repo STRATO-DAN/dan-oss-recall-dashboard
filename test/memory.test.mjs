@@ -44,6 +44,84 @@ test("CONCURRENCY: overlapping remember() calls all persist to the sidecar — n
   });
 });
 
+test("R1 CROSS-PROCESS: two independent writers on one dataDir don't lose each other's update (lock + read-modify-write merge)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-r1-"));
+  try {
+    // Two stores, two independent in-RAM snapshots — exactly what two OS processes on one dataDir have.
+    // Before the cross-process lock + read-modify-write merge, each save wrote only its OWN snapshot and the
+    // rename that landed last clobbered the other writer's memory (a real lost update). Now each save re-reads
+    // the on-disk set under an O_EXCL lock and merges, so both survive.
+    const a = new MemoryStore(dir); await a.init();
+    const b = new MemoryStore(dir); await b.init();
+    await Promise.all([
+      a.remember("memory from writer A", {}, { principal: "writer-a" }),
+      b.remember("memory from writer B", {}, { principal: "writer-b" }),
+    ]);
+    const reloaded = new MemoryStore(dir); await reloaded.init();
+    const texts = reloaded.list().map((m) => m.text).sort();
+    assert.deepEqual(texts, ["memory from writer A", "memory from writer B"],
+      "both writers' memories are durably persisted — neither update is lost to a clobbering rename");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("R3: a victim storing the query term does NOT change the attacker's own-doc BM25 score (per-principal corpus stats)", async () => {
+  await withStore(async (store) => {
+    // Attacker builds its own little corpus and records the score of its OWN memory for a query.
+    await store.remember("alpha beta gamma deploy token", {}, { principal: "attacker" });
+    await store.remember("some unrelated attacker note about lunch", {}, { principal: "attacker" });
+    const before = (await store.recall("deploy token", 5, { principal: "attacker" })).results;
+    const scoreBefore = before.find((r) => /alpha beta gamma/.test(r.text)).score;
+
+    // A DIFFERENT principal now stores many memories containing the query terms — which would move a GLOBAL
+    // corpus's document-frequency / average-length, and thus the attacker's own score (a term-presence oracle).
+    for (let i = 0; i < 8; i++) {
+      await store.remember(`victim secret ${i}: the deploy token rotates, the token really matters`, {}, { principal: "victim" });
+    }
+    const after = (await store.recall("deploy token", 5, { principal: "attacker" })).results;
+    const scoreAfter = after.find((r) => /alpha beta gamma/.test(r.text)).score;
+
+    assert.equal(scoreAfter, scoreBefore,
+      "the attacker's own-doc score must not shift when another principal stores the query term");
+    assert.ok(after.every((r) => !/victim secret/.test(r.text)), "content read-isolation is not weakened");
+  });
+});
+
+test("R5: quota is per-principal — one principal filling its budget doesn't starve another, and the error reflects only its own usage", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-r5-"));
+  const store = new MemoryStore(dir, { maxCount: 2 }); // honoured as the PER-PRINCIPAL budget
+  await store.init();
+  try {
+    await store.remember("alice 1", {}, { principal: "alice" });
+    await store.remember("alice 2", {}, { principal: "alice" });
+    // Alice is full — her 3rd is refused because of HER usage, not the store's...
+    await assert.rejects(() => store.remember("alice 3", {}, { principal: "alice" }), QuotaError);
+    // ...but Bob is entirely unaffected: he still has his own full budget (no cross-principal starvation).
+    await store.remember("bob 1", {}, { principal: "bob" });
+    await store.remember("bob 2", {}, { principal: "bob" });
+    assert.equal(store.list({ principal: "alice" }).length, 2);
+    assert.equal(store.list({ principal: "bob" }).length, 2);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("R10: a failed durable save rolls back the in-RAM state (no persisted-nothing / remembered-in-RAM divergence)", async () => {
+  await withStore(async (store) => {
+    await store.remember("first, saved fine", {}, { principal: "p" });
+    // Force the NEXT save to fail after the optimistic RAM push; the memory must not linger in RAM or usage.
+    const realPersist = store._persist.bind(store);
+    store._persist = async () => { throw new Error("disk full (simulated)"); };
+    await assert.rejects(() => store.remember("second, save fails", {}, { principal: "p" }), /disk full/);
+    store._persist = realPersist;
+    assert.equal(store.list().length, 1, "the memory whose save failed is not left in RAM");
+    assert.equal(store._usageFor("p").count, 1, "per-principal usage did not count the failed write");
+    const reloaded = new MemoryStore(store.dataDir); await reloaded.init();
+    assert.equal(reloaded.list().length, 1, "and it is not on disk either");
+  });
+});
+
 test("v0.4 per-principal read isolation: recall/list are scoped to the caller by default; admin + null + shared bypass", async () => {
   await withStore(async (store) => {
     await store.remember("the deploy key rotates every 90 days", {}, { principal: "agent-a" });
