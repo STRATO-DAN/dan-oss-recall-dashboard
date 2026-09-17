@@ -3,6 +3,37 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.6.0] — 2026-09-17
+
+### Security — deny-by-default embedding-egress secret gate
+
+When `OPENAI_API_KEY` is set, the text you Remember (and each Recall query) is sent to a third-party embeddings
+provider to build its vector. A memory or query that happens to carry a credential — an AWS key, a private-key
+block, an `sk-…` token, a JWT — would previously be sent verbatim in that request. This release stops a **detected
+secret** from leaving the process in an embedding request, scoped as narrowly as possible so the product's
+semantic-search value is untouched for everything else.
+
+#### Added
+- **Self-contained secret detector (`src/secrets.js`).** Zero-dependency, linear regexes only, and value-free —
+  it reports the NAMES of the patterns that matched, never the matched secret. Covers AWS access key ids,
+  PEM private-key blocks, OpenAI-style `sk-` keys, Stripe `sk_live_`/`rk_live_` keys, GitHub tokens and
+  fine-grained PATs, Google API keys, Slack tokens, JWTs, and generic `password/secret/token/api_key = "…"`
+  assignments.
+- **Egress gate at both embedding call sites** (default **on**):
+  - **On Remember** — if the memory text matches a secret pattern, its text is **not** sent to the embedding
+    provider. The memory is still stored and stays fully **BM25/keyword-recallable** — only its vector is
+    skipped. An `embedding-skipped-secret` audit event is recorded (acting principal + matched pattern **names**,
+    never the value). The write is **not** rejected.
+  - **On a Recall query** — a query that carries a secret skips the vector search and falls back to keyword
+    (BM25) ranking, so the query text is never sent to the provider.
+- **Opt-out** — `DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED=1` restores the prior behaviour (secret-bearing
+  text is embedded).
+
+#### Unchanged
+- Clean memories and clean queries embed exactly as before — hybrid semantic recall is not degraded.
+- v0.4 per-principal content read-isolation and all v0.5 guarantees are intact. Zero runtime dependencies
+  (embeddings/LanceDB remain optional-guarded).
+
 ## [0.5.0] — 2026-09-17
 
 ### Security — side-channels, shared-resource DoS, and durability (next layer after v0.4)

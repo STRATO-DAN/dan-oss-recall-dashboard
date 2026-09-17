@@ -20,6 +20,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { embed, embeddingsConfigured } from "./embeddings.js";
 import { tokenize, search as bm25Search } from "./bm25.js";
+import { detectSecrets, allowSecretEmbed } from "./secrets.js";
 
 const RRF_K = 60; // standard Reciprocal Rank Fusion constant (Elasticsearch's own default)
 
@@ -310,7 +311,17 @@ export class MemoryStore {
     let hasVector = false;
     let vector = null;
 
-    if (embeddingsConfigured()) {
+    // 🔴 v0.6 — deny-by-default embedding-egress secret gate. If a real embedding is about to be computed AND
+    // the text carries a detected secret, DO NOT send that text to the third-party embedding provider. The
+    // memory is still stored below (it stays fully BM25/keyword-recallable) — only its VECTOR is skipped, so
+    // the product's semantic-search value is untouched for every clean memory. Scoped as narrow as possible:
+    // an operator who genuinely wants the prior behaviour opts in with DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED.
+    const secretNamesOnRemember =
+      embeddingsConfigured() && !allowSecretEmbed() ? detectSecrets(text) : [];
+    if (secretNamesOnRemember.length > 0) {
+      // Record that egress was withheld — pattern NAMES only, never the secret value.
+      this._audit({ op: "embedding-skipped-secret", principal: principalId, patterns: secretNamesOnRemember });
+    } else if (embeddingsConfigured()) {
       // If a key IS configured a real embedding is expected — a transient API failure surfaces as a
       // real error rather than silently degrading just this one memory to BM25-only.
       // v0.7 — record the embedding EGRESS (text bytes leave the process boundary to OpenAI) so the audit
@@ -393,6 +404,16 @@ export class MemoryStore {
    * with the exact in-process cosine scan over exactly its own readable vectors. */
   async _vectorRank(query, limit, memories = this.memories, useIndex = true, principal = null) {
     if (!embeddingsConfigured() || !memories.some((m) => m.hasVector)) return [];
+    // 🔴 v0.6 — deny-by-default egress gate (recall side). Never send a secret-bearing QUERY to the embedding
+    // provider: skip the vector search and return empty, so recall() falls back to a complete BM25/keyword
+    // result over the caller's own set. Keyword recall is unaffected. Opt out with the same env flag.
+    if (!allowSecretEmbed()) {
+      const secretNamesOnQuery = detectSecrets(query);
+      if (secretNamesOnQuery.length > 0) {
+        this._audit({ op: "embedding-skipped-secret", principal: principal ?? "unknown", patterns: secretNamesOnQuery });
+        return [];
+      }
+    }
     // v0.7 — record embedding EGRESS on the recall path too (embed() runs on remember AND recall).
     this._audit({ action: "embedding", principal: principal ?? "unknown", bytes: Buffer.byteLength(query, "utf8") });
     const queryVector = await embed(query);
