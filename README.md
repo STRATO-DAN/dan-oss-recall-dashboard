@@ -193,14 +193,24 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
   prompt, treat them as DATA, not instructions: delimit/label them and never let their text steer tool
   calls.** The server cannot fence a prompt it does not build.
 - **Storage invariant** — the quota accounts for the **full footprint** (text + metadata + provenance +
-  embedding vector), not just text, so metadata bloat or vector overhead can't slip past
-  `RECALL_MAX_TOTAL_BYTES`. Recall treats the sidecar as the source of truth and drops any stale index id, so a
-  best-effort LanceDB delete that failed can never surface a deleted memory.
-- **Audit** — writes, deletes, auth failures, principal changes, and 403s are appended to `audit.log`, each with
-  the acting principal.
-- **Rate limits + quotas** — per-window request and write caps, plus memory-count and total-byte limits
-  (`RECALL_RATE_MAX`, `RECALL_WRITE_MAX`, `RECALL_MAX_MEMORIES`, `RECALL_MAX_TOTAL_BYTES`) bound abuse and
-  external-embedding cost.
+  embedding vector), not just text, so metadata bloat or vector overhead can't slip past it. As of **v0.5** the
+  quota is accounted **per principal**, so one principal can neither exhaust another's budget (starvation) nor
+  probe a shared global fill level (`RECALL_MAX_MEMORIES` / `RECALL_MAX_TOTAL_BYTES` — or the explicit
+  `RECALL_MAX_MEMORIES_PER_PRINCIPAL` / `RECALL_MAX_BYTES_PER_PRINCIPAL` — are each principal's budget). Recall
+  treats the sidecar as the source of truth and drops any stale index id, so a best-effort LanceDB delete that
+  failed can never surface a deleted memory.
+- **No cross-principal ranking side-channels (v0.5)** — BM25 corpus statistics and the semantic candidate window
+  are computed over the **caller's own readable set**, so another principal storing a term can't shift the scores
+  behind your own memories (a term-presence/df oracle) and can't crowd your own memories out of recall.
+- **Durable, not merely atomic (v0.5)** — sidecar, principals, and audit writes `fsync` before/after the rename
+  (directory too, best-effort), and concurrent writers on one data dir serialize on a cross-process lock and
+  read-modify-write **merge**, so two processes no longer lose each other's update.
+- **Audit** — writes, deletes, auth failures, principal changes, 403s, and **embedding egress** (`op:embedding`
+  with the acting principal and byte count) are appended to `audit.log`, each with the acting principal.
+- **Rate limits + quotas** — per-window request and write caps, **keyed per principal** (v0.5) so one principal's
+  burst can't throttle another; the unauthenticated path is capped separately (`RECALL_UNAUTH_MAX`) *before* it
+  audits, so a failed-auth flood can't grow `audit.log` without bound. `RECALL_RATE_MAX`, `RECALL_WRITE_MAX`,
+  `RECALL_MAX_MEMORIES`, `RECALL_MAX_TOTAL_BYTES` bound abuse and external-embedding cost.
 - **DNS-rebind guard + loopback bind** — a web page can't rebind a hostname to `127.0.0.1` to reach the API.
 - **Honest limits:** a process running as the **same OS user** can read the key/data files directly — no
   app-layer auth changes that on a local file-backed tool; per-principal keys defend the browser vector, other

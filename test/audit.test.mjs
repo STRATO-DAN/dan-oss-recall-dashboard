@@ -132,6 +132,22 @@ test("AUDIT: a successful forget really lands in audit.log with a real result", 
   }
 });
 
+test("R8: the unauthenticated path is rate-limited BEFORE it audits, so a flood can't grow audit.log without bound", async () => {
+  const { server, port, dataDir } = await start({ RECALL_UNAUTH_MAX: "3" });
+  try {
+    const codes = [];
+    for (let i = 0; i < 10; i++) codes.push((await req(port, "GET", "/api/memories")).status);
+    // up to the cap, an unauth request is a normal 401 (audited); past it, a bare 429 with nothing recorded.
+    assert.ok(codes.filter((c) => c === 401).length <= 3, "only up-to-cap unauth requests reach the 401+audit path");
+    assert.ok(codes.includes(429), "the unauth flood is throttled");
+    const authFailures = (await readAuditLines(dataDir)).filter((l) => l.action === "auth-failure");
+    assert.ok(authFailures.length <= 3, `audit growth from an unauth flood is capped (got ${authFailures.length})`);
+  } finally {
+    stop(server);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("AUDIT: a non-owner's denied forget really lands in audit.log as forget-denied", async () => {
   const { server, port, token, dataDir } = await start();
   try {

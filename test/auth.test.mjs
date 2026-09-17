@@ -94,6 +94,17 @@ test("with the token: a full remember → list → recall → forget round-trip 
   }
 });
 
+test("R10: a malformed remember (empty text) returns a real 400, not a 200 {ok:false}", async () => {
+  const { server, port, token } = await start();
+  try {
+    const r = await req(port, "POST", "/api/remember", { token, body: { text: "" } });
+    assert.equal(r.status, 400, "empty text is a client error → 400, not a 200 masquerading as success");
+    assert.equal(r.json.ok, false);
+  } finally {
+    server.closeAllConnections?.(); server.close();
+  }
+});
+
 test("a non-loopback Host header is refused (DNS-rebind guard, 403) even with a valid token", async () => {
   const { server, port, token } = await start();
   try {

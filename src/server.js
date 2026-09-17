@@ -69,27 +69,35 @@ function isLoopbackHost(hostHeader) {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
-// Fixed-window rate limiter. Single-principal tool, so one global window per limiter is the right shape.
-// Exported (pure, no side effects beyond its own closure) so tests can exercise the window-boundary
-// reset with a short, controllable windowMs, rather than a real 60s wait against the live server.
+// Fixed-window rate limiter, KEYED (v0.6). A per-principal key gives every principal its own window, so one
+// principal's burst can no longer exhaust a global counter and 429 everyone else (a cross-principal DoS).
+// Called with no key it falls back to a single shared window — the pre-auth path keys by remote address, and
+// the exported limiter stays testable with a short, controllable windowMs. Stale windows are pruned so the
+// key map can't grow without bound (keys are verified principals + one loopback address in practice).
 export function makeRateLimiter({ windowMs, max }) {
-  let windowStart = Date.now();
-  let count = 0;
-  return () => {
+  const windows = new Map(); // key → { windowStart, count }
+  return (key = "") => {
     const now = Date.now();
-    if (now - windowStart >= windowMs) { windowStart = now; count = 0; }
-    count += 1;
-    return count <= max;
+    if (windows.size > 4096) {
+      for (const [k, w] of windows) if (now - w.windowStart >= windowMs) windows.delete(k);
+    }
+    let w = windows.get(key);
+    if (!w || now - w.windowStart >= windowMs) { w = { windowStart: now, count: 0 }; windows.set(key, w); }
+    w.count += 1;
+    return w.count <= max;
   };
 }
 
 export function createServer({ dataDir }) {
-  const store = new MemoryStore(dataDir);
+  const audit = makeAudit(dataDir);
+  const store = new MemoryStore(dataDir, { audit }); // v0.7 — the store records embedding EGRESS through this sink
   const ready = store.init();
   const principals = new PrincipalStore(dataDir).load();
-  const audit = makeAudit(dataDir);
   const apiLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_RATE_MAX) || 600 });
   const writeLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_WRITE_MAX) || 120 });
+  // R8 — a separate, generous limiter for the UNAUTHENTICATED path, applied BEFORE its audit line so an
+  // unauthenticated flood cannot grow audit.log without bound. Keyed by remote address (loopback-scoped).
+  const unauthLimit = makeRateLimiter({ windowMs: 60_000, max: Number(process.env.RECALL_UNAUTH_MAX) || 60 });
 
   const server = http.createServer(async (req, res) => {
     await ready;
@@ -107,10 +115,16 @@ export function createServer({ dataDir }) {
         // is not identity, and neither is bare possession of one shared token — the server records WHICH one.
         principal = principals.authenticate(req);
         if (!principal) {
+          // R8 — rate-limit the unauthenticated caller BEFORE writing the audit line, so a flood of failed
+          // auth attempts can't grow audit.log unboundedly; over the cap it's a bare 429 with nothing recorded.
+          if (!unauthLimit(req.socket?.remoteAddress || "unknown")) {
+            return sendJson(res, 429, { ok: false, reason: "rate limit exceeded — slow down" });
+          }
           audit({ action: "auth-failure", path: p, method: req.method });
           return sendJson(res, 401, { ok: false, reason: "unauthorized — missing or invalid API key" });
         }
-        if (!apiLimit()) {
+        // R6 — per-principal rate-limit key: one principal's burst can't 429 another (cross-principal DoS).
+        if (!apiLimit(principal.id)) {
           return sendJson(res, 429, { ok: false, reason: "rate limit exceeded — slow down" });
         }
       }
@@ -156,7 +170,7 @@ export function createServer({ dataDir }) {
         });
       }
       if (p === "/api/remember" && req.method === "POST") {
-        if (!writeLimit()) {
+        if (!writeLimit(principal.id)) { // R6 — per-principal write limit
           return sendJson(res, 429, { ok: false, reason: "write rate limit exceeded — slow down" });
         }
         const body = await readBody(req);
@@ -172,7 +186,13 @@ export function createServer({ dataDir }) {
             audit({ action: "remember-rejected", reason: "quota", principal: principal.id });
             return sendJson(res, 413, { ok: false, reason: err.message });
           }
-          return sendJson(res, 200, { ok: false, reason: err.message });
+          // R10 — real status codes, not 200 {ok:false}: a bad request (e.g. empty text) is a 400, anything
+          // else a 500. Never reflect a raw upstream/provider error body back to the caller.
+          const clientError = /nothing real to remember|empty/i.test(err.message || "");
+          return sendJson(res, clientError ? 400 : 500, {
+            ok: false,
+            reason: clientError ? err.message : "internal error while storing the memory",
+          });
         }
       }
       if (p === "/api/recall" && req.method === "GET") {
@@ -189,7 +209,9 @@ export function createServer({ dataDir }) {
           });
           return sendJson(res, 200, { ok: true, ...result });
         } catch (err) {
-          return sendJson(res, 200, { ok: false, reason: err.message });
+          // R10 — a recall failure (e.g. an embedding-provider error) is a real 500, and never reflects the
+          // raw provider body (embeddings.js no longer includes it in the thrown error either).
+          return sendJson(res, 500, { ok: false, reason: "internal error while recalling" });
         }
       }
       const forgetMatch = p.match(/^\/api\/forget\/([^/]+)$/);
@@ -214,7 +236,8 @@ export function createServer({ dataDir }) {
       if (req.method === "GET" && !p.startsWith("/api/")) return serveStatic(res, p);
       res.writeHead(404).end("not found");
     } catch (err) {
-      sendJson(res, 500, { ok: false, reason: err.message });
+      // R10 — don't reflect a raw internal/provider error message to the caller.
+      sendJson(res, 500, { ok: false, reason: "internal error" });
     }
   });
 

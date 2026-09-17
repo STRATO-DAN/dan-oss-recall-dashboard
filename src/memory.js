@@ -85,19 +85,52 @@ export class MemoryStore {
   constructor(dataDir, opts = {}) {
     this.dataDir = dataDir;
     this.sidecarPath = path.join(dataDir, "memories.json");
+    this.lockPath = path.join(dataDir, ".memories.lock"); // v0.5 — cross-process save lock
     this.memories = []; // real records: { id, text, metadata, provenance, createdAt, hasVector, vector? }
     this.table = null; // LanceDB table, when the native package is available on this host
     this._lanceMod = undefined; // undefined = not yet checked; module | null after the first check
-    // Quotas (v0.2) — bound storage growth and embedding amplification. Configurable; sane defaults.
-    this.maxCount = opts.maxCount ?? (Number(process.env.RECALL_MAX_MEMORIES) || 100000);
-    this.maxTotalBytes = opts.maxTotalBytes ?? (Number(process.env.RECALL_MAX_TOTAL_BYTES) || 512 * 1024 * 1024);
-    this.totalBytes = 0; // running sum of stored text bytes, recomputed on init
+    this._tombstones = new Set(); // ids this instance has forgotten — never resurrected by a merge (v0.5)
+    // Quotas — bound storage growth and embedding amplification. v0.5: accounted PER PRINCIPAL, not globally,
+    // so one principal can neither starve the others nor probe a shared global fill level. The historical
+    // option/env names are honoured as the per-principal budget (each principal gets up to this much); the new
+    // RECALL_MAX_*_PER_PRINCIPAL names are preferred and take precedence.
+    this.maxCountPerPrincipal =
+      opts.maxCountPerPrincipal ?? opts.maxCount ??
+      (Number(process.env.RECALL_MAX_MEMORIES_PER_PRINCIPAL) || Number(process.env.RECALL_MAX_MEMORIES) || 100000);
+    this.maxBytesPerPrincipal =
+      opts.maxBytesPerPrincipal ?? opts.maxTotalBytes ??
+      (Number(process.env.RECALL_MAX_BYTES_PER_PRINCIPAL) || Number(process.env.RECALL_MAX_TOTAL_BYTES) || 512 * 1024 * 1024);
+    this.usage = new Map(); // principal → { count, bytes }; the per-principal accounting, recomputed on every save
+    this.totalBytes = 0; // running sum of ALL stored footprints (diagnostic; enforcement is per-principal)
+    // v0.7 — an optional audit sink (server passes makeAudit()). Used to record embedding EGRESS events so the
+    // audit trail's own "embedding calls" claim is actually true; defaults to a no-op for library/test callers.
+    this._audit = typeof opts.audit === "function" ? opts.audit : () => {};
     // v0.4 — per-principal READ isolation. By DEFAULT a principal's reads/searches see only the memories
     // it created (its verified provenance.principal). An operator who genuinely wants one shared team
     // corpus opts in explicitly via RECALL_SHARED_MEMORY. Authentication already told the server WHICH
     // principal is asking (v0.3); this makes authorization follow identity on reads too, so one shared
     // instance no longer hands every principal every other principal's memories.
     this.sharedMemory = opts.sharedMemory ?? /^(1|true|yes|on)$/i.test(process.env.RECALL_SHARED_MEMORY || "");
+  }
+
+  /** Recompute the per-principal usage table (and the diagnostic global total) from the current memories.
+   *  Called after every durable save so accounting can never drift from what is actually on disk. */
+  _recomputeUsage() {
+    this.usage = new Map();
+    this.totalBytes = 0;
+    for (const m of this.memories) {
+      const b = m._bytes ?? memoryBytes(m);
+      this.totalBytes += b;
+      const p = m.provenance?.principal || "unknown";
+      const u = this.usage.get(p) || { count: 0, bytes: 0 };
+      u.count += 1;
+      u.bytes += b;
+      this.usage.set(p, u);
+    }
+  }
+
+  _usageFor(principal) {
+    return this.usage.get(principal) || { count: 0, bytes: 0 };
   }
 
   /** Can `principal` read `memory`? Shared-memory mode → everyone; an admin (the instance operator) →
@@ -120,7 +153,7 @@ export class MemoryStore {
       }
       this.memories = [];
     }
-    this.totalBytes = this.memories.reduce((n, m) => n + memoryBytes(m), 0);
+    this._recomputeUsage();
     if (embeddingsConfigured() && this.memories.some((m) => m.hasVector)) {
       await this._openTable(); // best-effort; returns null (→ JS fallback) if LanceDB is unavailable
     }
@@ -155,20 +188,92 @@ export class MemoryStore {
     }
   }
 
+  /** Acquire an advisory CROSS-PROCESS lock on the data dir via an O_EXCL lock file (the portable,
+   *  zero-dependency cross-process mutex on a shared filesystem). Spins with jittered backoff and breaks
+   *  a stale lock left by a crashed writer, so a dead process can never wedge the store forever. */
+  async _acquireLock() {
+    const STALE_MS = 10_000;
+    const TIMEOUT_MS = 15_000;
+    const start = Date.now();
+    for (;;) {
+      try {
+        const fh = await fs.open(this.lockPath, "wx");
+        try { await fh.writeFile(`${process.pid} ${new Date().toISOString()}`); } catch { /* advisory only */ }
+        return fh;
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+        try {
+          const st = await fs.stat(this.lockPath);
+          if (Date.now() - st.mtimeMs > STALE_MS) { await fs.rm(this.lockPath, { force: true }); continue; }
+        } catch { continue; /* lock vanished under us — retry immediately */ }
+        if (Date.now() - start > TIMEOUT_MS) throw new Error("timed out acquiring the sidecar lock");
+        await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 10)));
+      }
+    }
+  }
+
+  async _releaseLock(fh) {
+    if (!fh) return;
+    try { await fh.close(); } catch { /* already closed */ }
+    try { await fs.rm(this.lockPath, { force: true }); } catch { /* already gone */ }
+  }
+
+  /** fsync a directory entry so a rename into it actually survives a crash. Not supported on every
+   *  platform (Windows), so it is strictly best-effort — the file fsync above is the load-bearing part. */
+  async _fsyncDir(dir) {
+    let dh;
+    try { dh = await fs.open(dir, "r"); await dh.sync(); }
+    catch { /* directory fsync unsupported here */ }
+    finally { try { await dh?.close(); } catch { /* ignore */ } }
+  }
+
   async _saveSidecar() {
-    // Serialize saves. Two concurrent writers previously shared ONE temp path (`.<pid>.tmp`) and could
-    // race the rename (ENOENT/EEXIST) AND lose an update (whichever rename lands last wins the file's
-    // content). Atomic replacement is not the same as atomic concurrent persistence. Each save now (a)
-    // waits for the previous one to finish, so writes are ordered and the last one reflects the latest
-    // `this.memories`, and (b) uses a per-write unique temp name so two in-flight writers never collide.
+    // Serialize saves WITHIN this process (each waits for the previous), then persist UNDER a cross-process
+    // lock. Intra-process ordering alone is not enough: two PROCESSES on one dataDir each hold their own
+    // stale snapshot and the rename that lands last wins the file — a real lost update. So each save now does
+    // a read-modify-write while holding the lock: it re-reads the on-disk set and MERGES it with this
+    // instance's memories (minus anything this instance has forgotten), so a concurrent process's freshly
+    // written memory is preserved instead of clobbered. Durability, not just atomicity: the temp file is
+    // fsync'd before the rename and the directory is fsync'd after it.
     const prev = this._saveChain || Promise.resolve();
-    const mine = prev.catch(() => {}).then(async () => {
-      const tmp = path.join(this.dataDir, `.memories.json.${process.pid}.${crypto.randomUUID()}.tmp`);
-      await fs.writeFile(tmp, JSON.stringify({ memories: this.memories }, null, 2), "utf8");
-      await fs.rename(tmp, this.sidecarPath);
-    });
+    const mine = prev.catch(() => {}).then(() => this._persist());
     this._saveChain = mine;
     return mine;
+  }
+
+  async _persist() {
+    const lock = await this._acquireLock();
+    try {
+      let onDisk = [];
+      try {
+        onDisk = JSON.parse(await fs.readFile(this.sidecarPath, "utf8")).memories ?? [];
+      } catch (err) {
+        if (err.code !== "ENOENT") throw err; // a real read error must not silently drop the other writer's data
+      }
+      // Merge: start from what is durably on disk (another process may have added rows we have never seen),
+      // drop anything THIS instance has forgotten, then overlay our own memories (adds win over a stale disk copy).
+      const merged = new Map();
+      for (const m of onDisk) if (!this._tombstones.has(m.id)) merged.set(m.id, m);
+      for (const m of this.memories) if (!this._tombstones.has(m.id)) merged.set(m.id, m);
+      const list = [...merged.values()];
+
+      const tmp = path.join(this.dataDir, `.memories.json.${process.pid}.${crypto.randomUUID()}.tmp`);
+      const fh = await fs.open(tmp, "w");
+      try {
+        await fh.writeFile(JSON.stringify({ memories: list }, null, 2), "utf8");
+        await fh.sync(); // flush file contents to disk BEFORE the rename — the "crash-safe" claim made real
+      } finally {
+        await fh.close();
+      }
+      await fs.rename(tmp, this.sidecarPath);
+      await this._fsyncDir(this.dataDir); // flush the rename itself
+
+      // Adopt the merged, durable truth so RAM never diverges from disk.
+      this.memories = list;
+      this._recomputeUsage();
+    } finally {
+      await this._releaseLock(lock);
+    }
   }
 
   // A stored memory carries its embedding vector in the sidecar (the source of truth); that big
@@ -183,18 +288,22 @@ export class MemoryStore {
     if (!text || !text.trim()) {
       throw new Error("Nothing real to remember — text is empty.");
     }
-    // Quota (v0.3) — account for the FULL footprint (text + metadata + provenance + the vector estimate when
+    // Quota (v0.5) — account for the FULL footprint (text + metadata + provenance + the vector estimate when
     // embeddings are on), not just text, and reject BEFORE any external embedding call so a runaway/unauthorized
     // caller can neither grow the store (via text OR metadata) nor amplify OpenAI cost past the configured bound.
+    // The accounting is PER PRINCIPAL: the check reflects only the CALLING principal's own usage, so one
+    // principal can neither exhaust another's budget (starvation) nor learn a global fill level (probe oracle).
+    const principalId = String(provenance.principal || "unknown").slice(0, 120);
     const VECTOR_BYTES_ESTIMATE = embeddingsConfigured() ? 1536 * 8 : 0; // typical embedding dim; refined post-embed
     const estBytes =
       memoryBytes({ text, metadata, provenance: { principal: provenance.principal, source: provenance.source } }) +
       VECTOR_BYTES_ESTIMATE;
-    if (this.memories.length >= this.maxCount) {
-      throw new QuotaError(`memory count limit reached (${this.maxCount}) — nothing stored`);
+    const usage = this._usageFor(principalId);
+    if (usage.count >= this.maxCountPerPrincipal) {
+      throw new QuotaError(`per-principal memory count limit reached (${this.maxCountPerPrincipal}) — nothing stored`);
     }
-    if (this.totalBytes + estBytes > this.maxTotalBytes) {
-      throw new QuotaError(`total storage limit reached (${this.maxTotalBytes} bytes) — nothing stored`);
+    if (usage.bytes + estBytes > this.maxBytesPerPrincipal) {
+      throw new QuotaError(`per-principal storage limit reached (${this.maxBytesPerPrincipal} bytes) — nothing stored`);
     }
     const id = crypto.randomUUID();
     const createdAt = new Date().toISOString();
@@ -204,6 +313,9 @@ export class MemoryStore {
     if (embeddingsConfigured()) {
       // If a key IS configured a real embedding is expected — a transient API failure surfaces as a
       // real error rather than silently degrading just this one memory to BM25-only.
+      // v0.7 — record the embedding EGRESS (text bytes leave the process boundary to OpenAI) so the audit
+      // trail's "embedding calls" claim is actually true. Egress BEHAVIOUR is deliberately unchanged here.
+      this._audit({ action: "embedding", principal: principalId, bytes: Buffer.byteLength(text, "utf8") });
       vector = await embed(text);
       hasVector = true;
       // Best-effort: also index it in LanceDB when the native package is present. The sidecar
@@ -248,37 +360,56 @@ export class MemoryStore {
     };
     if (hasVector) memory.vector = vector;
     memory._bytes = memoryBytes(memory); // exact footprint, so forget() reclaims precisely what remember() added
+    // R10 — the durable sidecar is the source of truth: only KEEP the memory in RAM if the save actually
+    // succeeds. Push, save, and on any failure roll the RAM state back so it can never diverge from disk
+    // (a persisted-nothing / remembered-in-RAM split). _saveSidecar recomputes usage from the merged truth.
     this.memories.push(memory);
-    this.totalBytes += memory._bytes;
-    await this._saveSidecar();
+    try {
+      await this._saveSidecar();
+    } catch (err) {
+      this.memories = this.memories.filter((m) => m.id !== id);
+      this._recomputeUsage();
+      throw err;
+    }
     return MemoryStore._public(memory);
   }
 
-  /** Real BM25 ranking over every stored memory's own text — always available, zero setup, zero
-   * external call. Same functions bm25.js exposes for its own unit tests, not a re-implementation. */
-  _bm25Rank(query) {
-    const documents = this.memories.map((m) => ({ id: m.id, tokens: tokenize(m.text) }));
+  /** Real BM25 ranking over the CALLER'S READABLE memories only. R3: BM25's corpus statistics (document
+   * frequency, average length) are computed over exactly the documents passed in — so scoping the corpus to
+   * the caller's own set means another principal storing a term can no longer shift the df/avgdl behind the
+   * caller's own scores (a cross-principal term-presence oracle). Same functions bm25.js exposes for its own
+   * unit tests, not a re-implementation. */
+  _bm25Rank(query, memories = this.memories) {
+    const documents = memories.map((m) => ({ id: m.id, tokens: tokenize(m.text) }));
     return bm25Search(query, documents).filter((r) => r.score > 0);
   }
 
-  /** Real semantic candidate ranking — LanceDB's indexed search when the native package is
-   * available, else the exact JS cosine scan over the same sidecar vectors. Returns empty (not an
-   * error) when hybrid isn't in play, so the caller falls back to a complete BM25-only result. */
-  async _vectorRank(query, limit) {
-    if (!embeddingsConfigured() || !this.memories.some((m) => m.hasVector)) return [];
+  /** Real semantic candidate ranking — LanceDB's indexed search when the native package is available, else
+   * the exact JS cosine scan. Returns empty (not an error) when hybrid isn't in play, so the caller falls back
+   * to a complete BM25-only result. R4: it ranks over the CALLER'S READABLE set so the k*3 candidate window is
+   * filled from the caller's own memories BEFORE the slice — another principal's (closer) vectors can no longer
+   * crowd the caller's own memories out of recall. LanceDB's index carries no principal column, so its fast path
+   * is used only for the full-corpus view (admin / shared / trusted in-process); a per-principal caller is ranked
+   * with the exact in-process cosine scan over exactly its own readable vectors. */
+  async _vectorRank(query, limit, memories = this.memories, useIndex = true, principal = null) {
+    if (!embeddingsConfigured() || !memories.some((m) => m.hasVector)) return [];
+    // v0.7 — record embedding EGRESS on the recall path too (embed() runs on remember AND recall).
+    this._audit({ action: "embedding", principal: principal ?? "unknown", bytes: Buffer.byteLength(query, "utf8") });
     const queryVector = await embed(query);
-    const table = await this._openTable();
-    if (table) {
-      try {
-        const hits = await table.vectorSearch(queryVector).limit(limit).toArray();
-        // LanceDB's `_distance` is L2 — smaller is more similar. Only the rank ORDER feeds RRF, so
-        // raw distance is kept as a diagnostic, never magnitude-blended with BM25's own score.
-        return hits.map((h, i) => ({ id: h.id, rank: i + 1, distance: h._distance }));
-      } catch {
-        this._lanceMod = null; // any native error → fall through to the exact JS engine
+    if (useIndex) {
+      const table = await this._openTable();
+      if (table) {
+        try {
+          const hits = await table.vectorSearch(queryVector).limit(limit).toArray();
+          // LanceDB's `_distance` is L2 — smaller is more similar. Only the rank ORDER feeds RRF, so
+          // raw distance is kept as a diagnostic, never magnitude-blended with BM25's own score.
+          return hits.map((h, i) => ({ id: h.id, rank: i + 1, distance: h._distance }));
+        } catch {
+          this._lanceMod = null; // any native error → fall through to the exact JS engine
+        }
       }
     }
-    return cosineRank(queryVector, this.memories, limit);
+    return cosineRank(queryVector, memories, limit);
   }
 
   /** Real Reciprocal Rank Fusion — combines a lexical and a semantic ranking without inventing a
@@ -312,29 +443,30 @@ export class MemoryStore {
       return { mode: "none", results: [] };
     }
     const byId = new Map(this.memories.map((m) => [m.id, m]));
-    const bm25Ranked = this._bm25Rank(query);
-    const hybridAvailable = embeddingsConfigured() && this.memories.some((m) => m.hasVector);
+    // v0.4/v0.5 — per-principal read isolation, computed ONCE up front so both the lexical and the semantic
+    // ranker score over exactly the caller's readable set (R3 corpus-stat oracle, R4 candidate crowd-out).
+    const fullView = this.sharedMemory || isAdmin || principal == null;
+    const readable = fullView ? this.memories : this.memories.filter((m) => this._canRead(m, principal, isAdmin));
+    const bm25Ranked = this._bm25Rank(query, readable);
+    const hybridAvailable = embeddingsConfigured() && readable.some((m) => m.hasVector);
 
     if (!hybridAvailable) {
       const results = bm25Ranked
         .filter((r) => r.score >= minScore)
-        // v0.4 — per-principal read isolation: a caller only recalls its OWN memories unless shared mode.
-        .filter((r) => this._canRead(byId.get(r.id), principal, isAdmin))
+        .filter((r) => byId.has(r.id)) // source-of-truth guard (defensive; readable ⊆ this.memories)
         .slice(0, k)
         .map((r) => ({ ...MemoryStore._public(byId.get(r.id)), score: r.score }));
       return { mode: "bm25", results };
     }
 
-    const vectorRanked = await this._vectorRank(query, Math.max(k * 3, 20));
+    const vectorRanked = await this._vectorRank(query, Math.max(k * 3, 20), readable, fullView, principal);
     const fused = MemoryStore._rrfCombine(bm25Ranked, vectorRanked);
     const results = fused
       .filter((r) => r.rrf >= minScore)
       // 🔴 v0.3 — the sidecar is the source of truth. Drop any id it no longer has (a stale LanceDB entry left
       // by a best-effort delete that failed) BEFORE mapping, so a diverged index can never surface a deleted
-      // memory as a malformed, id-less result.
+      // memory as a malformed, id-less result. (Read isolation is already applied via `readable` above.)
       .filter((r) => byId.has(r.id))
-      // v0.4 — per-principal read isolation (applied after the source-of-truth filter, before k-slice).
-      .filter((r) => this._canRead(byId.get(r.id), principal, isAdmin))
       .slice(0, k)
       .map((r) => ({ ...MemoryStore._public(byId.get(r.id)), score: r.rrf, bm25Score: r.bm25Score, vectorDistance: r.vectorDistance }));
     return { mode: "hybrid", results };
@@ -344,12 +476,27 @@ export class MemoryStore {
     const removed = this.memories.find((m) => m.id === id);
     if (!removed) return false;
     // Owner-scoped delete (v0.3): only the principal that created the memory — or an admin — may forget it.
+    // R9 (DOC): a non-owner still gets 403 here rather than 404. Unifying to 404 would remove a theoretical
+    // existence oracle, but it would also erase the owner-scoped contract's `forget-denied` audit signal, and
+    // the oracle is unreachable in practice — memory ids are unguessable UUIDv4 and are never exposed across
+    // principals by read isolation, so a caller cannot obtain another principal's id to probe with. Kept 403.
     if (principal !== undefined && !isAdmin && removed.provenance?.principal !== principal) {
       throw new ForbiddenError("this memory belongs to another principal — only its owner or an admin may forget it");
     }
+    // R10 — mutate RAM optimistically, then roll back if the durable save fails, so a failed delete can never
+    // leave RAM missing a memory the sidecar still holds. The tombstone makes the removal win any concurrent
+    // merge (so a stale on-disk copy from another writer cannot resurrect it). _saveSidecar recomputes usage.
+    const prevMemories = this.memories;
+    this._tombstones.add(id);
     this.memories = this.memories.filter((m) => m.id !== id);
-    this.totalBytes -= removed._bytes ?? memoryBytes(removed);
-    await this._saveSidecar();
+    try {
+      await this._saveSidecar();
+    } catch (err) {
+      this._tombstones.delete(id);
+      this.memories = prevMemories;
+      this._recomputeUsage();
+      throw err;
+    }
     if (this.table) {
       try {
         await this.table.delete(`id = '${id.replace(/'/g, "''")}'`);

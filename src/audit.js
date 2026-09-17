@@ -11,7 +11,17 @@ export function makeAudit(dataDir) {
   let warned = false;
   return function audit(event) {
     try {
-      fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
+      // R2 — fsync the append so a security-relevant event the log claims to record actually survives a
+      // crash. Open/append/fsync/close explicitly (appendFileSync gives no handle to fsync). Best-effort:
+      // a fsync failure still falls through to the warn-once path below rather than failing the operation.
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
+      const fd = fs.openSync(file, "a");
+      try {
+        fs.writeSync(fd, line);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
     } catch (err) {
       if (!warned) {
         warned = true;

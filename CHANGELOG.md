@@ -3,6 +3,58 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.5.0] — 2026-09-17
+
+### Security — side-channels, shared-resource DoS, and durability (next layer after v0.4)
+
+v0.4's per-principal **content** read-isolation is unchanged and intact — a principal still reads only its own
+memories. This release closes the ways one principal could still *observe* or *starve* another **without** reading
+their content, and makes the "atomic/crash-safe" framing actually true.
+
+#### Fixed — side-channels
+- **BM25 corpus-statistics oracle.** Lexical scores were computed over the **global** corpus, so another principal
+  storing a query term shifted the document-frequency/average-length behind your *own* memories' scores — a
+  term-presence oracle across the isolation boundary. BM25 corpus stats are now computed over the **caller's own
+  readable set**, so your scores depend only on your own memories.
+- **Vector candidate crowd-out + score channel.** Hybrid recall fetched `k*3` vector candidates **globally**, then
+  filtered by principal, then sliced — so another principal's (closer) vectors could push your own memories out of
+  the candidate window (recall shrink) and their distances leaked in. The semantic candidate set is now ranked over
+  the **caller's own readable set** *before* the slice.
+
+#### Fixed — shared-resource DoS
+- **Per-principal quotas.** Memory-count and total-byte quotas are now accounted **per principal**, so one principal
+  can neither exhaust another's budget (starvation) nor probe a shared global fill level. The historical
+  `RECALL_MAX_MEMORIES` / `RECALL_MAX_TOTAL_BYTES` are honoured as each principal's budget; the explicit
+  `RECALL_MAX_MEMORIES_PER_PRINCIPAL` / `RECALL_MAX_BYTES_PER_PRINCIPAL` take precedence.
+- **Per-principal rate limits.** The request and write limiters are now **keyed per principal**, so one principal's
+  burst can't 429 another (cross-principal DoS).
+- **Unauth flood can't grow the audit log.** The unauthenticated path is rate-limited (`RECALL_UNAUTH_MAX`, default
+  60/min) **before** it writes its `auth-failure` audit line, capping audit growth under a failed-auth flood.
+
+#### Fixed — durability & correctness
+- **Cross-process lost update.** `_saveSidecar` only serialized writes *within* one process; two processes on one
+  data dir each held a stale snapshot and the last rename clobbered the other's write. Saves now take a
+  **cross-process lock** and do a **read-modify-write merge** (re-read on-disk set, drop this instance's tombstones,
+  overlay its own memories), so concurrent processes no longer lose each other's updates.
+- **fsync on durable writes.** The sidecar, `principals.json`, and `audit.log` now `fsync` the file (and the parent
+  directory, best-effort) so a crash right after a write can't lose it — the "crash-safe" claim made real.
+- **Embedding egress is now actually audited.** `audit.js` claimed to record "embedding calls" but never did; the
+  store now emits an `embedding` audit event (principal + byte count) on both remember and recall. Egress
+  **behaviour** is deliberately unchanged (see note below).
+- **RAM never diverges from disk.** `remember`/`forget` now commit to in-RAM state **only after** the durable save
+  succeeds (rolling back on failure), instead of mutating RAM before awaiting the write.
+- **Honest HTTP errors.** `remember`/`recall` failures return real status codes (400 for a bad request, 500 for an
+  internal error) instead of `200 {ok:false}`, and no longer reflect a raw upstream provider error body back to the
+  caller (`embeddings.js` drops the provider body from the thrown error; it is logged locally instead).
+
+#### Notes / honest limits
+- **`forget` still returns 403 (not 404) to a non-owner.** Unifying to 404 would remove a theoretical existence
+  oracle, but it would also erase the owner-scoped `forget-denied` audit signal — and the oracle is unreachable in
+  practice, since memory ids are unguessable UUIDv4 and are never exposed across principals. Kept 403.
+- **Embedding egress is audited but not gated.** Whether a principal's text *should* be allowed to leave the process
+  to an external embeddings provider is a data-classification decision, deliberately **not** changed here.
+- Zero runtime dependencies unchanged (LanceDB/embeddings remain optional-guarded).
+
 ## [0.4.0] — 2026-09-17
 
 ### ⚠️ Behaviour change — reads are now per-principal

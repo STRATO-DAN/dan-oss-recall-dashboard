@@ -100,6 +100,64 @@ test("HYBRID: a memory with zero shared tokens with the query still surfaces via
       assert.equal(hit.bm25Score, 0, "confirms this hit came from the vector side, not BM25 (zero lexical overlap)");
     })));
 
+test("R4: a principal's own memory is not crowded out of the vector candidate window by another principal's closer vectors", () => {
+  const prevKey = process.env.OPENAI_API_KEY;
+  const prevFetch = global.fetch;
+  process.env.OPENAI_API_KEY = "sk-fake-r4";
+  // The query and every VICTIM doc embed to the same unit vector (cosine 1); the attacker's OWN doc embeds to a
+  // slightly-off vector (cosine 0.9). Globally the 25 victim vectors fill the entire k*3 candidate window ahead
+  // of the attacker's single doc, so pre-fix the attacker's own doc never reaches the vector side of RRF. With
+  // per-principal candidate selection it is ranked within the attacker's OWN set and keeps its vector hit.
+  global.fetch = async (url, opts) => {
+    const input = JSON.parse(opts.body).input.toLowerCase();
+    const v = input.includes("attacker-doc") ? [0.9, Math.sqrt(1 - 0.81)] : [1, 0];
+    return { ok: true, status: 200, json: async () => ({ data: [{ embedding: v }] }) };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "recall-r4-"));
+  const store = new MemoryStore(dir);
+  return store.init()
+    .then(async () => {
+      await store.remember("attacker-doc shared-term note", {}, { principal: "attacker" });
+      for (let i = 0; i < 25; i++) {
+        await store.remember(`victim ${i} shared-term filler`, {}, { principal: "victim" });
+      }
+      const res = await store.recall("shared-term query", 5, { principal: "attacker" });
+      assert.equal(res.mode, "hybrid");
+      const own = res.results.find((r) => /attacker-doc/.test(r.text));
+      assert.ok(own, "the attacker recalls its own memory");
+      assert.ok(own.vectorDistance !== null,
+        "its own memory was found by the VECTOR side too — not crowded out of the candidate window by another principal's closer vectors");
+      assert.ok(res.results.every((r) => !/victim/.test(r.text)), "content read-isolation is intact");
+    })
+    .finally(() => {
+      global.fetch = prevFetch;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+test("R7: embedding EGRESS is actually audited (action:embedding, principal, bytes) on BOTH remember and recall", () =>
+  withFakeEmbeddings(async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "recall-r7-"));
+    const events = [];
+    const store = new MemoryStore(dir, { audit: (e) => events.push(e) });
+    await store.init();
+    try {
+      await store.remember("a trip to the ocean", {}, { principal: "agent-x" });
+      const onRemember = events.find((e) => e.action === "embedding");
+      assert.ok(onRemember, "remember() records a real embedding-egress event (the audit claim is now true)");
+      assert.equal(onRemember.principal, "agent-x");
+      assert.ok(onRemember.bytes > 0, "the egress event records the byte count that left the process boundary");
+      events.length = 0;
+      await store.recall("ocean", 5, { principal: "agent-x" });
+      const onRecall = events.find((e) => e.action === "embedding");
+      assert.ok(onRecall, "recall() records an embedding-egress event too — embed() runs on recall as well");
+      assert.equal(onRecall.principal, "agent-x");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }));
+
 test("HYBRID: without OPENAI_API_KEY, the exact same store stays BM25-only (no silent hybrid claim)", () =>
   withStore(async (store) => {
     await store.remember("a trip to the ocean");

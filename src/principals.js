@@ -66,8 +66,22 @@ export class PrincipalStore {
     // env-declared principals are never written to disk (their keys live only in the environment)
     const persist = this.principals.filter((p) => !p.fromEnv).map(({ fromEnv, ...p }) => p);
     const tmp = path.join(this.dataDir, `.principals.json.${process.pid}.tmp`);
-    fs.writeFileSync(tmp, JSON.stringify({ principals: persist }, null, 2), { mode: 0o600 });
+    // R2 — durable, not merely atomic: fsync the temp file's contents BEFORE the rename, and fsync the
+    // directory AFTER it, so a crash right after this call can't lose a just-minted principal.
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify({ principals: persist }, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, this.file);
+    try {
+      const dfd = fs.openSync(this.dataDir, "r");
+      try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+    } catch {
+      /* directory fsync unsupported on some platforms — best-effort */
+    }
     try {
       fs.chmodSync(this.file, 0o600);
     } catch {
