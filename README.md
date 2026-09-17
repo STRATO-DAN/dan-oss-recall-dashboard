@@ -72,6 +72,45 @@ Agents/CI can also be provisioned out of band with `RECALL_PRINCIPALS="my-agent:
 memory's `provenance.principal` is the **verified** creator (unforgeable); an optional `source` label is
 recorded separately and treated as untrusted.
 
+## Scriptable & CI
+
+The launcher takes a few hand-rolled flags (zero dependencies), and a `Makefile` wraps the common
+developer and CI tasks.
+
+```bash
+dan-oss-recall-dashboard --version   # print the version, exit 0
+dan-oss-recall-dashboard --help      # usage, env vars, and the exit-code contract, exit 0
+dan-oss-recall-dashboard --json      # startup banner as ONE JSON object, for scripts/CI
+```
+
+`--json` prints exactly one object and nothing else — `{ "url", "port", "mode", "dataDir", "principal" }`
+— instead of the human banner (the human banner stays the default). With
+`DAN_OSS_RECALL_DASHBOARD_PORT=0` the server binds an OS-assigned ephemeral port and the banner reports
+the real one, so a script can boot a throwaway instance and read back where it landed.
+
+**Exit codes** (documented so CI can branch on them):
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — the server ran and exited cleanly, or `--version` / `--help`. |
+| `1` | Startup failure — e.g. the port is already in use, or the data directory is unusable. A single line on stderr, never a raw stack trace. |
+| `2` | Usage error — an unknown or invalid flag. |
+
+**Make targets** (`make help` lists them; no `npm install` needed):
+
+```bash
+make test     # the full suite: node --test test/*.test.mjs
+make attack   # ONLY the adversarial/security tests (must be green)
+make demo     # boot a throwaway instance and show ranked recall end-to-end (BM25 mode)
+make bench    # BM25 recall latency vs corpus size (100 / 1k / 10k)
+```
+
+**Try the attacks:** `make attack` runs only the adversarial tests — per-principal read isolation, the
+secret-egress gate, rate-limit (429) with per-principal isolation, and cross-process lost-update safety
+plus quota. They are expected to stay green.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for real `make bench` numbers and how to reproduce them.
+
 ## Two real modes, never blended
 
 | | Not set | Set `OPENAI_API_KEY` |
@@ -317,6 +356,9 @@ covering the cosine fallback) — all with no key, no network, and no LanceDB in
 | `public/` | The plain HTML/CSS/vanilla-JS Remember/Recall/Forget UI. |
 | `examples/` | Runnable example code — `MemoryStore` usage and the real accuracy measurement. |
 | `test/` | Real unit + integration tests (`npm test`, Node's own built-in test runner). |
+| `Makefile` | Developer/CI entrypoints — `make help`, `test`, `attack`, `demo`, `bench`. |
+| `scripts/` | `demo.sh` (end-to-end ranked-recall demo via `curl`) and `bench.mjs` (BM25 latency benchmark), plus the pre-commit guards. |
+| `BENCHMARKS.md` | Real BM25 recall-latency numbers and how to reproduce them (`make bench`). |
 
 ## FAQ
 

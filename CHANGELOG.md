@@ -3,6 +3,41 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.7.0] — 2026-09-17
+
+### Cross-cutting polish — scriptable launcher, exit-code contract, Make targets, benchmarks
+
+Purely additive. No existing route changes behaviour and no runtime dependency is added — the new
+launcher flags, scripts, and Makefile are Node standard library (plus `curl` for the demo) only.
+
+#### Added
+- **Launcher flags (hand-rolled, zero dependency)** on `bin/dan-oss-recall-dashboard.js`:
+  - `--version` / `-v` — print the version and exit `0`.
+  - `--help` / `-h` — usage, environment variables (including `DAN_OSS_RECALL_DASHBOARD_PORT` and the
+    egress-gate opt-out `DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED`), and the exit-code contract; exit `0`.
+  - `--json` — print the startup banner as ONE JSON object
+    (`{ url, port, mode, dataDir, principal }`) instead of the human text. The human banner remains the
+    default. `DAN_OSS_RECALL_DASHBOARD_PORT=0` now binds an OS-assigned ephemeral port and the banner
+    reports the real bound port.
+- **Exit-code contract** — startup failures (port already in use, unusable data directory) now print a
+  single line to stderr and exit non-zero (`1`) instead of throwing a raw stack trace; an unknown flag
+  exits `2`; success/`--version`/`--help` exit `0`. Documented in the README.
+- **`Makefile` with `make help`** — `make test` (full suite), `make attack` (only the adversarial
+  tests: per-principal read isolation, secret-egress gate, rate-limit + per-principal isolation,
+  cross-process lost-update safety + quota), `make demo` (boots a throwaway instance on an ephemeral
+  port, mints a principal, stores and recalls memories via `curl`, and shows ranked/scored results),
+  and `make bench` (BM25 recall latency vs corpus size).
+- **`BENCHMARKS.md`** — real `make bench` numbers (BM25 query latency at 100 / 1k / 10k memories) with
+  a machine note and reproduction steps.
+- **Audit trail records embedding egress** — the store now logs an `embedding` audit event (acting
+  principal + byte count, never the text) whenever text/query bytes leave the process for the
+  embeddings provider, so the audit trail's "embedding calls" claim is actually true. Egress behaviour
+  itself is unchanged.
+
+#### Unchanged
+- All `/api/` routes behave exactly as in v0.6. Zero runtime dependencies (embeddings/LanceDB remain
+  optional-guarded). The full test suite stays green.
+
 ## [0.6.0] — 2026-09-17
 
 ### Security — deny-by-default embedding-egress secret gate

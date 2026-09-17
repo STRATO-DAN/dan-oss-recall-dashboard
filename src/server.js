@@ -248,5 +248,15 @@ export function createServer({ dataDir }) {
 
 export function listen(port, dataDir) {
   const server = createServer({ dataDir });
-  return new Promise((resolve) => server.listen(port, "127.0.0.1", () => resolve(server)));
+  return new Promise((resolve, reject) => {
+    // Reject on a startup error (e.g. EADDRINUSE) instead of leaving the promise pending and letting
+    // the 'error' event crash with a raw stack — the launcher turns this into a one-line stderr + exit 1.
+    // The handler is removed once we bind successfully, so later operational errors keep their normal path.
+    const onError = (err) => reject(err);
+    server.once("error", onError);
+    server.listen(port, "127.0.0.1", () => {
+      server.removeListener("error", onError);
+      resolve(server);
+    });
+  });
 }
