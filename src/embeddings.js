@@ -1,5 +1,5 @@
 // Real embeddings, one real provider — OpenAI is the only one with a public embeddings API
-// (Anthropic does not ship one as of this writing). Stated plainly rather than pretending this
+// Stated plainly rather than pretending this
 // tool is provider-agnostic for embeddings the way DAN-OSS-COMMIT's own LLM call is.
 //
 // Honest failure: no key configured means real vector recall is unavailable — Recall degrades to
