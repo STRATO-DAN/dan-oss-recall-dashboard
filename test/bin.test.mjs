@@ -92,7 +92,10 @@ test("--help prints usage (with the version) and exits 0", async () => {
   const { code, stdout, stderr } = await runToExit(["--help"]);
   assert.equal(code, 0);
   assert.equal(stderr, "");
-  assert.match(stdout, new RegExp(`RECALL DASHBOARD v${VERSION.replace(/\./g, "\\.")}`));
+  assert.ok(
+    stdout.includes(`RECALL DASHBOARD v${VERSION}`),
+    `help banner should include "RECALL DASHBOARD v${VERSION}"`,
+  );
   assert.match(stdout, /Usage:/);
   assert.match(stdout, /--version/);
   assert.match(stdout, /--help/);
@@ -152,7 +155,7 @@ test("a port already in use is a startup failure: exit 1, one-line stderr, no st
     });
     assert.equal(code, 1);
     assert.equal(stdout, "");
-    assert.match(stderr, new RegExp(`port ${port} is already in use`));
+    assert.ok(stderr.includes(`port ${port} is already in use`), `stderr should report port ${port} in use`);
     assertCleanErrorLine(stderr);
   } finally {
     await new Promise((resolve) => blocker.close(resolve));
