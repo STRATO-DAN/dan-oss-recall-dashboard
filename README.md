@@ -166,7 +166,7 @@ local-embedding feature that pulls in `@huggingface/transformers` → a vulnerab
 calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functionality it needs
 (connect, create table, vector search, delete) without dragging in that chain.
 
-## Security model (v0.3)
+## Security model (v0.4)
 
 - **Per-principal API keys** — the API resolves each request's key to a *verified principal*, not just "someone
   holding a shared token." The bootstrap **admin** key is the auto-generated instance token (`0600`,
@@ -208,6 +208,16 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
   Reads are **per-principal by default** (`RECALL_SHARED_MEMORY=1` opts into a shared team corpus; admin sees
   all); full multi-org isolation and at-rest encryption are out of scope for this local tier (the store is
   plaintext JSON — rely on OS/disk encryption).
+  - **Per-principal isolation is an HTTP-surface guarantee, not a `MemoryStore` guarantee.** A caller using
+    `MemoryStore` directly (the programmatic/library entrypoint, not the HTTP API) bypasses `server.js` /
+    `auth.js` / `principals.js` entirely — there is no authentication or principal-scoping to bypass at that
+    layer, by design (this is the same trust tier as the admin/in-process bypass already documented above).
+    If you embed `MemoryStore` directly inside a larger application, that application is responsible for its
+    own principal boundary; RECALL's per-principal isolation only applies when callers go through the HTTP API.
+  - **The audit log is append-only by convention, not by cryptographic guarantee.** `audit.js` writes a plain
+    local file — a process with filesystem access to it can edit or truncate past entries undetected. This is
+    a record of what the server did, not a tamper-evident one; treat it as a debugging/ops trail, not as
+    forensic proof against a local attacker who already has filesystem access.
 
 ## What it never does
 
