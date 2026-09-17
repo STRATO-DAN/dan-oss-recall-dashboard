@@ -33,6 +33,12 @@ embeddings API (`api.openai.com`) to generate its vector — using your own key,
 account. With no key set, nothing ever leaves your machine; recall runs entirely on the local BM25
 engine.
 
+> **Secret-egress gate (v0.6, default on).** If a memory (or a Recall query) carries a detected secret
+> — an AWS key, a private-key block, an `sk-…` token, a JWT, and more — its text is **not** sent to the
+> embeddings provider. The memory is still stored and stays fully keyword-recallable; only its vector is
+> skipped (a secret query falls back to keyword search). Opt out with
+> `DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED=1`. See [Security model](#security-model-v04).
+
 ## Use
 
 ```bash
@@ -202,6 +208,16 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
 - **No cross-principal ranking side-channels (v0.5)** — BM25 corpus statistics and the semantic candidate window
   are computed over the **caller's own readable set**, so another principal storing a term can't shift the scores
   behind your own memories (a term-presence/df oracle) and can't crowd your own memories out of recall.
+- **Deny-by-default embedding-egress secret gate (v0.6)** — with `OPENAI_API_KEY` set, the text you Remember and
+  each Recall query is otherwise sent to a third-party embeddings provider. A self-contained, zero-dependency
+  detector (`src/secrets.js` — AWS keys, private-key blocks, `sk-…`/`sk_live_`/`rk_live_` keys, GitHub tokens and
+  PATs, Google API keys, Slack tokens, JWTs, and generic `secret/token/api_key = "…"` assignments) keeps a
+  **detected secret out of that request**. On Remember the memory is still stored and stays fully keyword/BM25
+  recallable — only its **vector** is skipped, and an `embedding-skipped-secret` audit event records the acting
+  principal and the matched pattern **names** (never the secret value); the write is **not** rejected. A
+  secret-bearing Recall query skips the vector search and falls back to keyword ranking. This is scoped narrowly:
+  clean memories and clean queries embed exactly as before. Opt out (restore prior behaviour) with
+  `DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED=1`.
 - **Durable, not merely atomic (v0.5)** — sidecar, principals, and audit writes `fsync` before/after the rename
   (directory too, best-effort), and concurrent writers on one data dir serialize on a cross-process lock and
   read-modify-write **merge**, so two processes no longer lose each other's update.
@@ -238,6 +254,8 @@ calls OpenAI's embeddings API directly — so `0.30.0` gives the exact functiona
 - Never returns a memory that shares zero real terms with the query in BM25 mode — a real
   corpus-derived floor (score `0`), not an arbitrary cutoff.
 - Never loses a memory to a crash mid-save — the sidecar file is written atomically.
+- Never sends a **detected secret** to the third-party embeddings provider by default — the memory stays
+  keyword-recallable, only its vector is skipped (override: `DAN_OSS_RECALL_DASHBOARD_ALLOW_SECRET_EMBED=1`).
 
 ## Examples
 
