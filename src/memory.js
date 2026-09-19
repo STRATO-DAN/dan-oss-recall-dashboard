@@ -144,7 +144,7 @@ export class MemoryStore {
   }
 
   async init() {
-    await fs.mkdir(this.dataDir, { recursive: true });
+    await fs.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
     try {
       const raw = await fs.readFile(this.sidecarPath, "utf8");
       this.memories = JSON.parse(raw).memories ?? [];
@@ -193,20 +193,17 @@ export class MemoryStore {
    *  zero-dependency cross-process mutex on a shared filesystem). Spins with jittered backoff and breaks
    *  a stale lock left by a crashed writer, so a dead process can never wedge the store forever. */
   async _acquireLock() {
-    const STALE_MS = 10_000;
     const TIMEOUT_MS = 15_000;
     const start = Date.now();
     for (;;) {
       try {
-        const fh = await fs.open(this.lockPath, "wx");
+        const fh = await fs.open(this.lockPath, "wx", 0o600);
         try { await fh.writeFile(`${process.pid} ${new Date().toISOString()}`); } catch { /* advisory only */ }
         return fh;
       } catch (err) {
         if (err.code !== "EEXIST") throw err;
-        try {
-          const st = await fs.stat(this.lockPath);
-          if (Date.now() - st.mtimeMs > STALE_MS) { await fs.rm(this.lockPath, { force: true }); continue; }
-        } catch { continue; /* lock vanished under us — retry immediately */ }
+        // Never steal a lock based on age. A slow live writer is still its owner.
+        // After a crash, an operator must verify no writer is alive before removing the lock.
         if (Date.now() - start > TIMEOUT_MS) throw new Error("timed out acquiring the sidecar lock");
         await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 10)));
       }
@@ -215,8 +212,12 @@ export class MemoryStore {
 
   async _releaseLock(fh) {
     if (!fh) return;
+    try {
+      const held = await fh.stat();
+      const current = await fs.stat(this.lockPath);
+      if (held.ino === current.ino && held.dev === current.dev) await fs.unlink(this.lockPath);
+    } catch { /* path already gone or replaced: never remove another owner's lock */ }
     try { await fh.close(); } catch { /* already closed */ }
-    try { await fs.rm(this.lockPath, { force: true }); } catch { /* already gone */ }
   }
 
   /** fsync a directory entry so a rename into it actually survives a crash. Not supported on every
@@ -257,9 +258,20 @@ export class MemoryStore {
       for (const m of onDisk) if (!this._tombstones.has(m.id)) merged.set(m.id, m);
       for (const m of this.memories) if (!this._tombstones.has(m.id)) merged.set(m.id, m);
       const list = [...merged.values()];
+      const committedUsage = new Map();
+      for (const memory of list) {
+        const owner = memory.provenance?.principal || "unknown";
+        const usage = committedUsage.get(owner) || { count: 0, bytes: 0 };
+        usage.count += 1;
+        usage.bytes += memoryBytes(memory);
+        if (usage.count > this.maxCountPerPrincipal || usage.bytes > this.maxBytesPerPrincipal) {
+          throw new QuotaError("Per-principal quota exceeded after merging concurrent writes; nothing stored");
+        }
+        committedUsage.set(owner, usage);
+      }
 
       const tmp = path.join(this.dataDir, `.memories.json.${process.pid}.${crypto.randomUUID()}.tmp`);
-      const fh = await fs.open(tmp, "w");
+      const fh = await fs.open(tmp, "w", 0o600);
       try {
         await fh.writeFile(JSON.stringify({ memories: list }, null, 2), "utf8");
         await fh.sync(); // flush file contents to disk BEFORE the rename — the "crash-safe" claim made real
@@ -286,6 +298,14 @@ export class MemoryStore {
   }
 
   async remember(text, metadata = {}, provenance = {}) {
+    const input = structuredClone({ text, metadata, provenance });
+    const run = () => this._remember(input.text, input.metadata, input.provenance);
+    const pending = (this._rememberTail || Promise.resolve()).then(run);
+    this._rememberTail = pending.catch(() => {});
+    return pending;
+  }
+
+  async _remember(text, metadata = {}, provenance = {}) {
     if (!text || !text.trim()) {
       throw new Error("Nothing real to remember — text is empty.");
     }
@@ -380,6 +400,9 @@ export class MemoryStore {
     } catch (err) {
       this.memories = this.memories.filter((m) => m.id !== id);
       this._recomputeUsage();
+      if (this.table && hasVector) {
+        try { await this.table.delete(`id = '${id.replace(/'/g, "''")}'`); } catch { /* best-effort rollback */ }
+      }
       throw err;
     }
     return MemoryStore._public(memory);
@@ -460,6 +483,9 @@ export class MemoryStore {
    * in hybrid mode a memory only needs to be found by BM25 OR the vector search to rank at all, so
    * `minScore` filters on the fused RRF score. Either way: return what actually scored. */
   async recall(query, k = 5, { minScore = 0, principal = null, isAdmin = false } = {}) {
+    if (!Number.isInteger(k) || k < 1 || k > 100) throw new RangeError("k must be an integer between 1 and 100");
+    if (!Number.isFinite(minScore) || minScore < 0) throw new RangeError("minScore must be a finite nonnegative number");
+    if (typeof query !== "string" || Buffer.byteLength(query, "utf8") > 16384) throw new RangeError("query must be a string of at most 16384 bytes");
     if (!query || !query.trim()) {
       return { mode: "none", results: [] };
     }
