@@ -129,12 +129,7 @@ async function recall() {
     results.innerHTML = RECALL_PLACEHOLDER;
     return;
   }
-  const limit = Number($("recallLimit").value);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-    results.textContent = "Results must be a whole number between 1 and 100.";
-    return;
-  }
-  const res = await api(`/api/recall?q=${encodeURIComponent(q)}&k=${limit}`);
+  const res = await api(`/api/recall?q=${encodeURIComponent(q)}`);
   const data = await res.json();
   if (!data.ok) {
     results.innerHTML = `<li class="empty-note">${escapeHtml(data.reason)}</li>`;
