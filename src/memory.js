@@ -547,8 +547,11 @@ export class MemoryStore {
     if (this.table) {
       try {
         await this.table.delete(`id = '${id.replace(/'/g, "''")}'`);
-      } catch {
-        /* index cleanup is best-effort — the sidecar (source of truth) no longer has this memory */
+      } catch (err) {
+        // Best-effort stays best-effort (the sidecar source of truth no longer has this memory),
+        // but the orphan is now AUDITED so a cleanup sweep can find it — a swallowed failure is
+        // how ghost index rows accumulate silently. Never throws: audit is best-effort too.
+        this._audit({ action: "vector-delete-failed", id, principal: principal ?? "unknown", error: err.message });
       }
     }
     return true;
