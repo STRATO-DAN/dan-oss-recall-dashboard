@@ -38,8 +38,7 @@ function keyHash(key, salt) {
 // new/rotated keys always get a salt (see keyHash() above), and every successful legacy match is migrated
 // to a salted hash on the spot in authenticate(), so this path is exercised at most once per old key.
 function legacyKeyHash(key) {
-  // codeql[js/insufficient-password-hash] -- intentional one-time legacy-format comparison, not new storage.
-  return crypto.createHash("sha256").update(key).digest("hex");
+  return crypto.createHash("sha256").update(key).digest("hex"); // lgtm[js/insufficient-password-hash]
 }
 function timingEqual(a, b) {
   const ba = Buffer.from(String(a));
