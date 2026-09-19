@@ -303,3 +303,23 @@ test("crash/recovery (v0.3): recall drops a stale index id the sidecar no longer
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test("forget() audits a failed vector delete so orphans are findable (never swallowed)", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dan-oss-recall-test-"));
+  const captured = [];
+  const store = new MemoryStore(dir, { audit: (e) => captured.push(e) });
+  await store.init();
+  try {
+    const m = await store.remember("memory whose index row will fail to delete");
+    // A vector backend whose delete throws: the sidecar removal must still succeed, and the
+    // orphan must be audited (not swallowed) for a later cleanup sweep.
+    store.table = { delete: async () => { throw new Error("index unavailable"); } };
+    assert.equal(await store.forget(m.id), true);
+    assert.equal(store.list().length, 0, "sidecar removal still lands despite index failure");
+    const entry = captured.find((e) => e.action === "vector-delete-failed" && e.id === m.id);
+    assert.ok(entry, "a vector-delete-failed audit entry names the orphaned id");
+    assert.match(entry.error, /index unavailable/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
