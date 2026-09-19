@@ -30,17 +30,20 @@ export class PrincipalStore {
     this.dataDir = dataDir;
     this.file = path.join(dataDir, "principals.json");
     this.principals = []; // { id, name, keyHash, role, createdAt, fromEnv? }
+    this.envPrincipals = (process.env.RECALL_PRINCIPALS || "").trim();
     this.adminKey = loadOrCreateToken(dataDir); // the v0.2 token = the admin bootstrap key (back-compat)
   }
 
   load() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
+    fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     try {
       this.principals = JSON.parse(fs.readFileSync(this.file, "utf8")).principals ?? [];
-    } catch {
+    } catch (err) {
+      if (err.code !== "ENOENT") throw new Error("Principal state cannot be read; refusing to reset identities");
       this.principals = [];
     }
-    const env = (process.env.RECALL_PRINCIPALS || "").trim();
+    if (!Array.isArray(this.principals)) throw new Error("Invalid principal state");
+    const env = this.envPrincipals;
     if (env) {
       for (const pair of env.split(",")) {
         const i = pair.indexOf(":");
@@ -49,7 +52,7 @@ export class PrincipalStore {
         const key = pair.slice(i + 1).trim();
         if (name && key && !this.principals.some((p) => p.name === name)) {
           this.principals.push({
-            id: `p_${crypto.randomBytes(6).toString("hex")}`,
+            id: `env_${keyHash(name)}`,
             name,
             keyHash: keyHash(key),
             role: "member",
@@ -92,6 +95,7 @@ export class PrincipalStore {
   /** Resolve the request's bearer key → a verified principal, or null. The admin key maps to the admin
    *  principal; every other key is matched (constant-time) against the stored hashes. */
   authenticate(req) {
+    try { this.load(); } catch { return null; }
     const key = extractBearer(req);
     if (!key) return null;
     if (timingEqual(key, this.adminKey)) return { id: ADMIN_ID, name: "admin", role: "admin" };

@@ -18,7 +18,9 @@ export function loadOrCreateToken(dataDir) {
     /* not created yet — generate */
   }
   const token = crypto.randomBytes(32).toString("base64url");
-  fs.mkdirSync(dataDir, { recursive: true });
+  // FINDING 01 fix: restrictive modes on create; existing paths tightened best-effort.
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dataDir, 0o700); } catch {}
   fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
   try {
     fs.chmodSync(tokenPath, 0o600);

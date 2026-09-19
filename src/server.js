@@ -163,10 +163,23 @@ export function createServer({ dataDir }) {
         return sendJson(res, removed ? 200 : 404, { ok: removed, reason: removed ? undefined : "no such principal" });
       }
       if (p === "/api/memories" && req.method === "GET") {
+        // FINDING 07 fix: bounded corpus read — full-corpus return is a DoS at scale.
+        // ?limit (default 100, max 500) + ?offset; status count stays exact via /api/status.
+        const limitRaw = url.searchParams.get("limit");
+        const offsetRaw = url.searchParams.get("offset");
+        const limit = limitRaw === null ? 100 : Number(limitRaw);
+        const offset = offsetRaw === null ? 0 : Number(offsetRaw);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 500 || !Number.isInteger(offset) || offset < 0) {
+          return sendJson(res, 400, { ok: false, reason: "limit must be an integer 1-500 and offset a nonnegative integer" });
+        }
         // v0.4 — per-principal read isolation: return only the caller's own memories (admin/shared → all).
+        const all = store.list({ principal: principal.id, isAdmin: principals.isAdmin(principal) });
         return sendJson(res, 200, {
           ok: true,
-          memories: store.list({ principal: principal.id, isAdmin: principals.isAdmin(principal) }),
+          memories: all.slice(offset, offset + limit),
+          total: all.length,
+          limit,
+          offset,
         });
       }
       if (p === "/api/remember" && req.method === "POST") {
@@ -197,7 +210,7 @@ export function createServer({ dataDir }) {
       }
       if (p === "/api/recall" && req.method === "GET") {
         const q = url.searchParams.get("q") || "";
-        const k = Number(url.searchParams.get("k")) || 5;
+        const k = url.searchParams.has("k") ? Number(url.searchParams.get("k")) : 5;
         const minScoreParam = url.searchParams.get("minScore");
         const minScore = minScoreParam === null ? undefined : Number(minScoreParam);
         try {
@@ -209,6 +222,7 @@ export function createServer({ dataDir }) {
           });
           return sendJson(res, 200, { ok: true, ...result });
         } catch (err) {
+          if (err instanceof RangeError) return sendJson(res, 400, { ok: false, reason: err.message });
           // R10 — a recall failure (e.g. an embedding-provider error) is a real 500, and never reflects the
           // raw provider body (embeddings.js no longer includes it in the thrown error either).
           return sendJson(res, 500, { ok: false, reason: "internal error while recalling" });
