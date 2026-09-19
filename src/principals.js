@@ -16,8 +16,29 @@ import { loadOrCreateToken, extractBearer } from "./auth.js";
 
 export const ADMIN_ID = "admin";
 
-function keyHash(key) {
-  return crypto.createHash("sha256").update(key).digest("hex");
+// Non-secret identifier derivation (e.g. a stable id from a principal NAME) — sha256 is fine here, there
+// is no credential to protect.
+function idHash(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+// Credential hashing. Generated keys are 256-bit random (crypto.randomBytes(32)) so a fast hash would be
+// defensible on its own, but RECALL_PRINCIPALS keys are operator-typed and may be low entropy — scrypt
+// (memory-hard, salted) protects that path too, at a per-check cost that stays small against a self-hosted
+// dashboard's principal count.
+const SCRYPT_KEYLEN = 32;
+const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 };
+function newSalt() {
+  return crypto.randomBytes(16).toString("hex");
+}
+function keyHash(key, salt) {
+  return crypto.scryptSync(key, salt, SCRYPT_KEYLEN, SCRYPT_OPTS).toString("hex");
+}
+// Intentional one-time verification bridge for pre-scrypt (v0.3-v0.6) key records; successful match
+// migrates to salted scrypt immediately (see authenticate() below). Not used for any new storage —
+// create() and env-declared principals always get a salted hash via keyHash() above.
+function legacyKeyHash(key) {
+  return crypto.createHash("sha256").update(key).digest("hex"); // codeql[js/insufficient-password-hash]
 }
 function timingEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -30,17 +51,20 @@ export class PrincipalStore {
     this.dataDir = dataDir;
     this.file = path.join(dataDir, "principals.json");
     this.principals = []; // { id, name, keyHash, role, createdAt, fromEnv? }
+    this.envPrincipals = (process.env.RECALL_PRINCIPALS || "").trim();
     this.adminKey = loadOrCreateToken(dataDir); // the v0.2 token = the admin bootstrap key (back-compat)
   }
 
   load() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
+    fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     try {
       this.principals = JSON.parse(fs.readFileSync(this.file, "utf8")).principals ?? [];
-    } catch {
+    } catch (err) {
+      if (err.code !== "ENOENT") throw new Error("Principal state cannot be read; refusing to reset identities");
       this.principals = [];
     }
-    const env = (process.env.RECALL_PRINCIPALS || "").trim();
+    if (!Array.isArray(this.principals)) throw new Error("Invalid principal state");
+    const env = this.envPrincipals;
     if (env) {
       for (const pair of env.split(",")) {
         const i = pair.indexOf(":");
@@ -48,10 +72,12 @@ export class PrincipalStore {
         const name = pair.slice(0, i).trim();
         const key = pair.slice(i + 1).trim();
         if (name && key && !this.principals.some((p) => p.name === name)) {
+          const salt = newSalt();
           this.principals.push({
-            id: `p_${crypto.randomBytes(6).toString("hex")}`,
+            id: `env_${idHash(name)}`,
             name,
-            keyHash: keyHash(key),
+            keySalt: salt,
+            keyHash: keyHash(key, salt),
             role: "member",
             createdAt: new Date().toISOString(),
             fromEnv: true,
@@ -92,12 +118,25 @@ export class PrincipalStore {
   /** Resolve the request's bearer key → a verified principal, or null. The admin key maps to the admin
    *  principal; every other key is matched (constant-time) against the stored hashes. */
   authenticate(req) {
+    try { this.load(); } catch { return null; }
     const key = extractBearer(req);
     if (!key) return null;
     if (timingEqual(key, this.adminKey)) return { id: ADMIN_ID, name: "admin", role: "admin" };
-    const h = keyHash(key);
     for (const p of this.principals) {
-      if (timingEqual(p.keyHash, h)) return { id: p.id, name: p.name, role: p.role };
+      if (p.keySalt) {
+        if (timingEqual(p.keyHash, keyHash(key, p.keySalt))) return { id: p.id, name: p.name, role: p.role };
+        continue;
+      }
+      // No salt on this record → minted before scrypt (pre-0.7.0). Verify against the legacy sha256 hash,
+      // then migrate it to a salted scrypt hash in place so it never needs this fallback again.
+      if (timingEqual(p.keyHash, legacyKeyHash(key))) {
+        if (!p.fromEnv) {
+          p.keySalt = newSalt();
+          p.keyHash = keyHash(key, p.keySalt);
+          this._save();
+        }
+        return { id: p.id, name: p.name, role: p.role };
+      }
     }
     return null;
   }
@@ -114,10 +153,12 @@ export class PrincipalStore {
       throw new Error(`a principal named '${clean}' already exists`);
     }
     const key = crypto.randomBytes(32).toString("base64url");
+    const salt = newSalt();
     const p = {
       id: `p_${crypto.randomBytes(6).toString("hex")}`,
       name: clean,
-      keyHash: keyHash(key),
+      keySalt: salt,
+      keyHash: keyHash(key, salt),
       role: "member",
       createdAt: new Date().toISOString(),
     };
@@ -128,7 +169,7 @@ export class PrincipalStore {
 
   /** Principal list for the admin — never exposes key material. */
   list() {
-    return this.principals.map(({ keyHash: _k, fromEnv: _f, ...p }) => p);
+    return this.principals.map(({ keyHash: _k, keySalt: _s, fromEnv: _f, ...p }) => p);
   }
 
   remove(id) {
