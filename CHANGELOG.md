@@ -3,6 +3,32 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.8.0] — 2026-09-19
+
+### Security
+
+- **Salted scrypt principal key hashing** (was: shared, unsalted sha256). Generated keys are
+  256-bit random so a fast hash was defensible on its own, but `RECALL_PRINCIPALS` keys are
+  operator-typed and may be low entropy. A pre-existing unsalted record still authenticates once
+  and is migrated to the new format automatically on that first successful auth — already-issued
+  keys keep working, no operator action needed.
+- **File/directory permissions restricted to owner-only** (0700 dirs / 0600 files) for the token
+  file, audit log, and their parents.
+- **Sidecar lock is never reclaimed by age.** A slow-but-live writer could previously have its lock
+  stolen from under it purely because the lock file was "old"; now only the actual owning process
+  releases its own lock, and a crash requires an operator to confirm no writer is alive before
+  removing a stale lock.
+- **Per-principal quota is now checked transactionally**, inside the cross-process lock against
+  the just-merged on-disk state, closing a TOCTOU where two concurrent writers could each pass a
+  quota check against stale usage.
+- `remember()` calls are now serialized per-process; `recall()`'s `k`/`minScore`/`query`
+  parameters are now strictly validated.
+
+### Fixed
+
+- `GET /api/memories` is now paginated (`?limit`, default 100, max 500; `?offset`) instead of
+  returning the caller's entire corpus in one response.
+
 ## [0.7.0] — 2026-09-17
 
 ### Cross-cutting polish — scriptable launcher, exit-code contract, Make targets, benchmarks
