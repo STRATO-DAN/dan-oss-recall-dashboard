@@ -15,13 +15,15 @@ export function makeAudit(dataDir) {
       // crash. Open/append/fsync/close explicitly (appendFileSync gives no handle to fsync). Best-effort:
       // a fsync failure still falls through to the warn-once path below rather than failing the operation.
       const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
-      const fd = fs.openSync(file, "a");
+      // FINDING 01 fix: owner-only audit — the file sits outside the HTTP auth boundary.
+      const fd = fs.openSync(file, "a", 0o600);
       try {
         fs.writeSync(fd, line);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
+      try { fs.chmodSync(file, 0o600); } catch {}
     } catch (err) {
       if (!warned) {
         warned = true;

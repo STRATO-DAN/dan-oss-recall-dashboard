@@ -46,6 +46,8 @@
       <h2><span id="icon-recall"></span>Recall</h2>
       <div class="recall-row">
         <input type="text" id="recallQuery" placeholder="What are you trying to recall?">
+        <label for="recallLimit">Results (1–100)</label>
+        <input type="number" id="recallLimit" value="5" min="1" max="100" step="1">
         <button class="dan-btn" id="recallBtn">Recall</button>
       </div>
       <ul class="memory-list" id="recallResults"></ul>
