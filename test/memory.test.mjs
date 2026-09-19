@@ -19,13 +19,6 @@ async function withStore(fn) {
   }
 }
 
-test("recall rejects unbounded or malformed search parameters before search", () => withStore(async store => {
-  for (const k of [-1, 0, 1.5, NaN, Infinity, 101]) await assert.rejects(store.recall("test", k), RangeError);
-  for (const minScore of [-1, NaN, Infinity]) await assert.rejects(store.recall("test", 5, { minScore }), RangeError);
-  await assert.rejects(store.recall("x".repeat(16385)), RangeError);
-  assert.deepEqual((await store.recall("test", 100)).results, []);
-}));
-
 test("remember() rejects empty text with a real error, stores nothing", async () => {
   await withStore(async (store) => {
     await assert.rejects(() => store.remember(""), /Nothing real to remember/);

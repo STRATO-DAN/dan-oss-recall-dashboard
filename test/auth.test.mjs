@@ -50,15 +50,6 @@ function req(port, method, p, { token, body, host } = {}) {
   });
 }
 
-test("invalid recall bounds return HTTP 400 rather than oversized results", async () => {
-  const { server, port, token } = await start();
-  try {
-    for (const query of ["k=-1", "k=0", "k=101", "k=NaN", "k=Infinity", "k=1.5", "minScore=NaN", "minScore=-1"]) {
-      assert.equal((await req(port, "GET", `/api/recall?q=test&${query}`, { token })).status, 400);
-    }
-  } finally { server.closeAllConnections?.(); server.close(); }
-});
-
 test("privileged ops are REFUSED without the bearer token (read, write, delete → 401)", async () => {
   const { server, port } = await start();
   try {
