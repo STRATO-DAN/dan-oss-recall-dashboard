@@ -35,8 +35,10 @@ function keyHash(key, salt) {
   return crypto.scryptSync(key, salt, SCRYPT_KEYLEN, SCRYPT_OPTS).toString("hex");
 }
 // Pre-scrypt format (v0.3–v0.6): unsalted sha256(key). Kept ONLY to verify keys minted before this change —
-// new/rotated keys always get a salt. A legacy match is a caller responsibility to migrate (see authenticate()).
+// new/rotated keys always get a salt (see keyHash() above), and every successful legacy match is migrated
+// to a salted hash on the spot in authenticate(), so this path is exercised at most once per old key.
 function legacyKeyHash(key) {
+  // codeql[js/insufficient-password-hash] -- intentional one-time legacy-format comparison, not new storage.
   return crypto.createHash("sha256").update(key).digest("hex");
 }
 function timingEqual(a, b) {
