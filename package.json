@@ -1,6 +1,6 @@
 {
   "name": "@strato-dan/recall-dashboard",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "[DAN] RECALL DASHBOARD — Remember. Recall. Forget. Real BM25-ranked recall by default, real hybrid (BM25 + semantic) when OPENAI_API_KEY is set.",
   "license": "MIT",
   "type": "module",

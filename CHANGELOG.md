@@ -3,6 +3,15 @@
 All notable changes to `@strato-dan/recall-dashboard` are documented here.
 This project uses [semantic versioning](https://semver.org/).
 
+## [0.8.1] — 2026-09-19
+
+### Fixed
+
+- **Failed vector deletes are audited (Finding 06 follow-up).** `forget()` still removes
+  from the sidecar source of truth when the index delete throws, but the orphan is now
+  recorded as a `vector-delete-failed` audit event naming the id instead of being swallowed
+  — a cleanup sweep can find it.
+
 ## [0.8.0] — 2026-09-19
 
 ### Security
