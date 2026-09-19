@@ -7,7 +7,9 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { createServer } from "../src/server.js";
+import { PrincipalStore } from "../src/principals.js";
 
 function start() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "recall-principals-"));
@@ -128,4 +130,32 @@ test("principal management is admin-only", async () => {
   } finally {
     stop(server);
   }
+});
+
+test("a pre-scrypt (unsalted sha256) key from a v0.6 install still authenticates, and is migrated in place", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "recall-principals-legacy-"));
+  const key = crypto.randomBytes(32).toString("base64url");
+  const legacyHash = crypto.createHash("sha256").update(key).digest("hex");
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dataDir, "principals.json"),
+    JSON.stringify({
+      principals: [{ id: "p_legacy", name: "old-agent", keyHash: legacyHash, role: "member", createdAt: new Date().toISOString() }],
+    }),
+  );
+
+  const store1 = new PrincipalStore(dataDir).load();
+  const req1 = { headers: { authorization: `Bearer ${key}` } };
+  const auth1 = store1.authenticate(req1);
+  assert.ok(auth1, "the legacy sha256-hashed key still authenticates");
+  assert.equal(auth1.id, "p_legacy");
+
+  const onDisk = JSON.parse(fs.readFileSync(path.join(dataDir, "principals.json"), "utf8")).principals[0];
+  assert.ok(onDisk.keySalt, "authenticate() migrated the record to a salted hash");
+  assert.notEqual(onDisk.keyHash, legacyHash, "the stored hash is no longer the legacy sha256 value");
+
+  const store2 = new PrincipalStore(dataDir).load();
+  const auth2 = store2.authenticate({ headers: { authorization: `Bearer ${key}` } });
+  assert.ok(auth2, "the same key still authenticates after migration, on a fresh load");
+  assert.equal(auth2.id, "p_legacy");
 });
