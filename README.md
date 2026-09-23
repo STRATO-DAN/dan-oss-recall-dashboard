@@ -321,14 +321,21 @@ The test suite is Node's own built-in runner (`node --test`) — no test framewo
 ```console
 $ npm test
 ...
-# tests 33
-# pass 33
+# tests 83
+# pass 83
 # fail 0
 ```
 
-20 tests pass — 8 BM25-engine unit tests (`test/bm25.test.mjs`), 7 `MemoryStore` integration tests
-(`test/memory.test.mjs`), and 5 pure-JS vector-engine tests (`test/vector-fallback.test.mjs`,
-covering the cosine fallback) — all with no key, no network, and no LanceDB installed.
+**83 tests pass**, with no key, no network, and no LanceDB installed: 8 BM25-engine unit tests
+(`test/bm25.test.mjs`), 5 pure-JS vector-engine tests (`test/vector-fallback.test.mjs`, covering
+the cosine fallback), and 6 hybrid-search tests (`test/hybrid.test.mjs`) cover the search core;
+20 `MemoryStore` integration tests (`test/memory.test.mjs`, including the cross-process lock and
+the per-principal BM25 corpus-scoping regression) plus 6 principal-isolation tests
+(`test/principals.test.mjs`) cover storage and isolation; 6 auth tests (`test/auth.test.mjs`), 6
+per-principal rate-limit tests (`test/ratelimit.test.mjs`), 7 audit-log tests
+(`test/audit.test.mjs`), and 7 secret-egress-gate tests (`test/secret-egress-gate.test.mjs`) cover
+the security surface; 4 review-state tests (`test/review-state.test.mjs`) and 8 launcher/CLI tests
+(`test/bin.test.mjs`) round out the rest.
 
 ## Dependencies
 
